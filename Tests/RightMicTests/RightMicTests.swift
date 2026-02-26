@@ -384,7 +384,7 @@ final class RingBufferWriterTests: XCTestCase {
 
     // MARK: - Security Tests
 
-    func testFilePermissionsAreRestrictive() throws {
+    func testFilePermissionsAllowDriverRead() throws {
         let path = tempPath()
         let writer = RingBufferWriter(path: path)
         try writer.open()
@@ -392,7 +392,7 @@ final class RingBufferWriterTests: XCTestCase {
 
         let attrs = try FileManager.default.attributesOfItem(atPath: path)
         let posix = (attrs[.posixPermissions] as! NSNumber).uint16Value
-        XCTAssertEqual(posix, 0o600, "File should be owner-only read/write (0600), got \(String(posix, radix: 8))")
+        XCTAssertEqual(posix, 0o644, "File should be owner read-write, others read (0644) for HAL driver access, got \(String(posix, radix: 8))")
     }
 
     func testOpenRejectsSymlink() throws {

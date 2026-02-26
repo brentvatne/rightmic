@@ -57,7 +57,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
             Darwin.close(fd)
         }
-        unlink(path)
+        // Do NOT unlink the file — the HAL driver may still have it mapped.
+        // Zeroing the header above is sufficient to invalidate stale data.
+        // Unlinking would force a new inode, leaving the driver reading
+        // from the old (now deleted) file until IO restarts.
     }
 
     // MARK: - Status Item
@@ -216,9 +219,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             } else {
                 try SMAppService.mainApp.register()
             }
+            sender.state = SMAppService.mainApp.status == .enabled ? .on : .off
         } catch {
             NSLog("[RightMic] Failed to update login item: \(error)")
         }
+        NSLog("[RightMic] Login item status after toggle: \(SMAppService.mainApp.status.rawValue)")
     }
 
     @objc private func quitApp() {

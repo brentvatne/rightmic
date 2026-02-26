@@ -111,6 +111,7 @@ public struct PriorityConfig: Codable, Equatable {
                 $0.name == device.name && $0.transportType == device.transportType && !connectedUIDs.contains($0.uid)
             }) {
                 // Device reconnected with a new UID — update the existing entry in place
+                let oldUID = entries[idx].uid
                 entries[idx] = PriorityEntry(
                     uid: device.uid,
                     name: device.name,
@@ -118,6 +119,10 @@ public struct PriorityConfig: Codable, Equatable {
                     enabled: entries[idx].enabled,
                     dependsOn: entries[idx].dependsOn
                 )
+                // Update any dependsOn references that pointed to the old UID
+                for i in entries.indices where entries[i].dependsOn == oldUID {
+                    entries[i].dependsOn = device.uid
+                }
             } else {
                 entries.append(PriorityEntry(from: device))
             }

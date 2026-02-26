@@ -66,11 +66,17 @@ public final class RingBufferWriter {
         assert(MemoryLayout<RingBufferHeader>.size == Self.headerSize,
                "RingBufferHeader size mismatch with headerSize constant")
 
-        // Create the backing file (read-write for owner only; O_NOFOLLOW prevents symlink attacks)
-        fd = Darwin.open(path, O_CREAT | O_RDWR | O_NOFOLLOW, 0o600)
+        // Create the backing file. O_NOFOLLOW prevents symlink attacks.
+        // Permissions: owner read-write, others read-only (0644).
+        // The HAL driver runs as _coreaudiod and needs read access.
+        fd = Darwin.open(path, O_CREAT | O_RDWR | O_NOFOLLOW, 0o644)
         guard fd >= 0 else {
             throw RingBufferError.openFailed(errno: errno)
         }
+
+        // Ensure correct permissions even if the file already existed with
+        // stricter permissions from a previous version.
+        fchmod(fd, 0o644)
 
         // Validate the opened file descriptor
         var st = stat()
