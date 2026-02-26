@@ -148,14 +148,18 @@ end
 
 def find_signing_identity
   output = sh("security find-identity -v -p codesigning", log: false) rescue ""
-  match = output.match(/"(Developer ID Application: .+)"/)
-  match ? match[1] : nil
+  match = output.match(/([0-9A-F]{40})\s+"(Developer ID Application: .+)"/)
+  return nil unless match
+  UI.message("Found signing identity: #{match[2]} (#{match[1]})")
+  match[1]  # return SHA-1 hash to avoid ambiguity with multiple certs
 end
 
 def find_installer_identity
   output = sh("security find-identity -v", log: false) rescue ""
-  match = output.match(/"(Developer ID Installer: .+)"/)
-  match ? match[1] : nil
+  match = output.match(/([0-9A-F]{40})\s+"(Developer ID Installer: .+)"/)
+  return nil unless match
+  UI.message("Found installer identity: #{match[2]} (#{match[1]})")
+  match[1]  # return SHA-1 hash
 end
 
 def sign_driver(identity:)
