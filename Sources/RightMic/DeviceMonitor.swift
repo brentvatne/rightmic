@@ -137,21 +137,12 @@ final class DeviceMonitor: ObservableObject {
     }
 
     /// Auto-add any connected input devices that aren't already in the priority list,
-    /// and update names for existing entries (in case the device was renamed).
+    /// update UIDs for reconnected devices, and remove stale duplicates.
     private func autoAddNewDevices() {
-        let knownUIDs = Set(priorityConfig.entries.map(\.uid))
-        let virtualDeviceUID = DriverStatus.virtualDeviceUID
-        for device in inputDevices {
-            if device.uid == virtualDeviceUID { continue }
-            if !knownUIDs.contains(device.uid) {
-                NSLog("[RightMic] Auto-adding new device: \(device.name) (\(device.uid))")
-                priorityConfig.entries.append(PriorityEntry(from: device))
-            } else if let idx = priorityConfig.entries.firstIndex(where: { $0.uid == device.uid }),
-                      priorityConfig.entries[idx].name != device.name {
-                NSLog("[RightMic] Updating device name: \(priorityConfig.entries[idx].name) → \(device.name)")
-                priorityConfig.entries[idx].name = device.name
-            }
-        }
+        priorityConfig.reconcile(
+            connectedDevices: inputDevices,
+            excludingUID: DriverStatus.virtualDeviceUID
+        )
     }
 
     // MARK: - Priority Config Helpers

@@ -209,6 +209,102 @@ final class PriorityConfigTests: XCTestCase {
     }
 }
 
+// MARK: - PriorityConfig Reconciliation Tests
+
+final class PriorityConfigReconcileTests: XCTestCase {
+
+    func testAddsNewDevice() {
+        var config = PriorityConfig()
+        let device = AudioDevice(deviceID: 1, name: "Mic", uid: "uid-1", transportType: .usb)
+        config.reconcile(connectedDevices: [device])
+        XCTAssertEqual(config.entries.count, 1)
+        XCTAssertEqual(config.entries[0].uid, "uid-1")
+        XCTAssertEqual(config.entries[0].name, "Mic")
+    }
+
+    func testDoesNotDuplicateExistingDevice() {
+        var config = PriorityConfig(entries: [
+            PriorityEntry(uid: "uid-1", name: "Mic", transportType: .usb),
+        ])
+        let device = AudioDevice(deviceID: 1, name: "Mic", uid: "uid-1", transportType: .usb)
+        config.reconcile(connectedDevices: [device])
+        XCTAssertEqual(config.entries.count, 1)
+    }
+
+    func testUpdatesNameForExistingDevice() {
+        var config = PriorityConfig(entries: [
+            PriorityEntry(uid: "uid-1", name: "Old Name", transportType: .usb),
+        ])
+        let device = AudioDevice(deviceID: 1, name: "New Name", uid: "uid-1", transportType: .usb)
+        config.reconcile(connectedDevices: [device])
+        XCTAssertEqual(config.entries.count, 1)
+        XCTAssertEqual(config.entries[0].name, "New Name")
+    }
+
+    func testReconnectedDeviceUpdatesUID() {
+        var config = PriorityConfig(entries: [
+            PriorityEntry(uid: "old-uid", name: "Shure MV7", transportType: .usb, enabled: true, dependsOn: "dep-uid"),
+        ])
+        // Same device reconnects with a new UID
+        let device = AudioDevice(deviceID: 2, name: "Shure MV7", uid: "new-uid", transportType: .usb)
+        config.reconcile(connectedDevices: [device])
+
+        XCTAssertEqual(config.entries.count, 1, "Should update in place, not add a duplicate")
+        XCTAssertEqual(config.entries[0].uid, "new-uid")
+        XCTAssertEqual(config.entries[0].enabled, true, "Should preserve enabled state")
+        XCTAssertEqual(config.entries[0].dependsOn, "dep-uid", "Should preserve dependency")
+    }
+
+    func testReconnectedDevicePreservesPosition() {
+        var config = PriorityConfig(entries: [
+            PriorityEntry(uid: "uid-a", name: "Built-in", transportType: .builtIn),
+            PriorityEntry(uid: "old-uid", name: "Shure MV7", transportType: .usb),
+            PriorityEntry(uid: "uid-c", name: "AirPods", transportType: .bluetooth),
+        ])
+        let connected = [
+            AudioDevice(deviceID: 1, name: "Built-in", uid: "uid-a", transportType: .builtIn),
+            AudioDevice(deviceID: 2, name: "Shure MV7", uid: "new-uid", transportType: .usb),
+            AudioDevice(deviceID: 3, name: "AirPods", uid: "uid-c", transportType: .bluetooth),
+        ]
+        config.reconcile(connectedDevices: connected)
+
+        XCTAssertEqual(config.entries.count, 3)
+        XCTAssertEqual(config.entries[1].uid, "new-uid", "Shure MV7 should remain at position 1")
+        XCTAssertEqual(config.entries[1].name, "Shure MV7")
+    }
+
+    func testRemovesStaleDuplicate() {
+        var config = PriorityConfig(entries: [
+            PriorityEntry(uid: "current-uid", name: "Shure MV7", transportType: .usb),
+            PriorityEntry(uid: "stale-uid", name: "Shure MV7", transportType: .usb),
+        ])
+        let device = AudioDevice(deviceID: 1, name: "Shure MV7", uid: "current-uid", transportType: .usb)
+        config.reconcile(connectedDevices: [device])
+
+        XCTAssertEqual(config.entries.count, 1, "Stale duplicate should be removed")
+        XCTAssertEqual(config.entries[0].uid, "current-uid")
+    }
+
+    func testDoesNotRemoveDisconnectedDeviceWithoutDuplicate() {
+        var config = PriorityConfig(entries: [
+            PriorityEntry(uid: "uid-1", name: "Shure MV7", transportType: .usb),
+        ])
+        // No connected devices — the entry should remain (just disconnected)
+        config.reconcile(connectedDevices: [])
+        XCTAssertEqual(config.entries.count, 1, "Disconnected device without a duplicate should persist")
+    }
+
+    func testExcludesVirtualDevice() {
+        var config = PriorityConfig()
+        let virtual = AudioDevice(deviceID: 1, name: "RightMic", uid: "com.rightmic.device", transportType: .virtual)
+        let real = AudioDevice(deviceID: 2, name: "Mic", uid: "uid-1", transportType: .usb)
+        config.reconcile(connectedDevices: [virtual, real], excludingUID: "com.rightmic.device")
+
+        XCTAssertEqual(config.entries.count, 1)
+        XCTAssertEqual(config.entries[0].uid, "uid-1")
+    }
+}
+
 // MARK: - RingBufferWriter Tests
 
 final class RingBufferWriterTests: XCTestCase {
