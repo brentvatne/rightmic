@@ -1,0 +1,43 @@
+# Xcode
+build/
+DerivedData/
+*.xcodeproj/xcuserdata/
+*.xcworkspace/xcuserdata/
+*.pbxuser
+*.mode1v3
+*.mode2v3
+*.perspectivev3
+*.xccheckout
+*.moved-aside
+xcuserdata/
+
+# Swift Package Manager
+.build/
+.swiftpm/
+Package.resolved
+
+# macOS
+.DS_Store
+*.swp
+*~
+
+# App bundle
+*.app
+*.dmg
+
+# Environment
+.env
+
+# Certificates and secrets
+*.p12
+*.cer
+*.pem
+*.key
+*.certSigningRequest
+*.mobileprovision
+*.provisionprofile
+
+# Ruby / Fastlane
+vendor/bundle
+**/fastlane/report.xml
+**/fastlane/README.md

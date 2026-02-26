@@ -1,0 +1,225 @@
+$stdout.sync = true
+
+default_platform(:mac)
+
+APP_NAME = "RightMic"
+BUNDLE_ID = "com.rightmic.app"
+ENTITLEMENTS = "Sources/RightMic/RightMic.entitlements"
+INFO_PLIST = "Sources/RightMic/Info.plist"
+
+platform :mac do
+
+  desc "Create or fetch Developer ID Application certificate"
+  lane :setup_cert do
+    cert(
+      type: "developer_id_application",
+      platform: "macos"
+    )
+  end
+
+  desc "Build the release binary and assemble .app bundle"
+  lane :build do
+    sh("cd .. && swift build -c release --arch arm64 --arch x86_64")
+    assemble_app_bundle
+  end
+
+  desc "Build, sign, notarize, and create DMG"
+  lane :release do |options|
+    # Build
+    build
+
+    # Sign
+    if options[:signing_identity]
+      sign_app(identity: options[:signing_identity])
+    else
+      # Try to get cert from keychain (CI imports it before this lane)
+      identity = find_signing_identity
+      sign_app(identity: identity) if identity
+    end
+
+    # Notarize (only if signed)
+    identity = find_signing_identity
+    if identity && ENV["APPLE_ID"]
+      notarize_app
+    else
+      UI.important("Skipping notarization (no signing identity or Apple ID)")
+    end
+
+    # Package
+    create_dmg
+  end
+
+  desc "Set up GitHub secrets for CI (interactive)"
+  lane :setup_ci_secrets do
+    require "open3"
+
+    # Ensure gh is available
+    unless system("gh auth status > /dev/null 2>&1")
+      UI.user_error!("GitHub CLI not authenticated. Run: gh auth login")
+    end
+
+    # Create cert if needed
+    setup_cert
+
+    # Find the cert
+    identity = find_signing_identity
+    UI.user_error!("No Developer ID certificate found") unless identity
+
+    team_id = identity.match(/\(([A-Z0-9]+)\)/)&.captures&.first
+    UI.user_error!("Could not extract Team ID from: #{identity}") unless team_id
+
+    # Export .p12
+    UI.message("Exporting certificate...")
+    p12_path = File.join(Dir.tmpdir, "RightMic-cert.p12")
+    p12_password = UI.password("Choose a password for the .p12 export: ")
+
+    # Export via security command
+    sh("security export -k login.keychain-db -t identities -f pkcs12 -o '#{p12_path}' -P '#{p12_password}'")
+
+    cert_base64 = Base64.strict_encode64(File.read(p12_path))
+
+    # Get Apple ID for notarization
+    apple_id = UI.input("Apple ID (email): ")
+    UI.message("You need an app-specific password for notarization.")
+    UI.message("Create one at: https://appleid.apple.com/account/manage/section/security")
+    sh("open 'https://appleid.apple.com/account/manage/section/security'") rescue nil
+    apple_id_password = UI.password("App-specific password: ")
+
+    # Set GitHub secrets
+    Dir.chdir("..") do
+      [
+        ["DEVELOPER_ID_CERT_BASE64", cert_base64],
+        ["DEVELOPER_ID_CERT_PASSWORD", p12_password],
+        ["APPLE_ID", apple_id],
+        ["APPLE_ID_PASSWORD", apple_id_password],
+        ["APPLE_TEAM_ID", team_id],
+      ].each do |name, value|
+        Open3.popen3("gh", "secret", "set", name) do |stdin, _stdout, _stderr, _wait|
+          stdin.write(value)
+          stdin.close
+        end
+        UI.success("Set secret: #{name}")
+      end
+    end
+
+    FileUtils.rm_f(p12_path)
+    UI.success("All GitHub secrets configured! Release with: git tag v0.1.0 && git push --tags")
+  end
+end
+
+# ---------- helpers ----------
+
+def assemble_app_bundle
+  build_dir = File.expand_path("../build", Dir.pwd)
+  app_bundle = File.join(build_dir, "#{APP_NAME}.app")
+  contents = File.join(app_bundle, "Contents")
+
+  bin_path = sh("cd .. && swift build -c release --arch arm64 --arch x86_64 --show-bin-path").strip
+  binary = File.join(bin_path, APP_NAME)
+
+  UI.user_error!("Binary not found at #{binary}") unless File.exist?(binary)
+
+  FileUtils.rm_rf(app_bundle)
+  FileUtils.mkdir_p(File.join(contents, "MacOS"))
+  FileUtils.mkdir_p(File.join(contents, "Resources"))
+
+  FileUtils.cp(binary, File.join(contents, "MacOS", APP_NAME))
+  FileUtils.cp(File.expand_path("../#{INFO_PLIST}", Dir.pwd), File.join(contents, "Info.plist"))
+
+  # Copy SPM resource bundle if present
+  resource_bundle = File.join(bin_path, "RightMic_RightMic.bundle")
+  if File.directory?(resource_bundle)
+    FileUtils.cp_r(resource_bundle, File.join(contents, "Resources/"))
+  end
+
+  UI.success("App bundle: #{app_bundle}")
+  app_bundle
+end
+
+def find_signing_identity
+  output = sh("security find-identity -v -p codesigning", log: false) rescue ""
+  match = output.match(/"(Developer ID Application: .+)"/)
+  match ? match[1] : nil
+end
+
+def sign_app(identity:)
+  app_bundle = File.expand_path("../build/#{APP_NAME}.app", Dir.pwd)
+  entitlements = File.expand_path("../#{ENTITLEMENTS}", Dir.pwd)
+
+  UI.message("Signing with: #{identity}")
+  sh(
+    "codesign --deep --force --options runtime " \
+    "--sign '#{identity}' " \
+    "--entitlements '#{entitlements}' " \
+    "'#{app_bundle}'"
+  )
+  sh("codesign --verify --verbose=2 '#{app_bundle}'")
+  UI.success("Signed and verified")
+end
+
+def notarize_app
+  app_bundle = File.expand_path("../build/#{APP_NAME}.app", Dir.pwd)
+  zip_path = File.expand_path("../build/#{APP_NAME}-notarize.zip", Dir.pwd)
+
+  sh("cd '#{File.dirname(app_bundle)}' && zip -r '#{zip_path}' '#{APP_NAME}.app'")
+
+  require "json"
+
+  UI.message("Submitting #{zip_path} for notarization...")
+  submit_out = sh(
+    "xcrun notarytool submit '#{zip_path}' " \
+    "--apple-id '#{ENV['APPLE_ID']}' " \
+    "--password '#{ENV['APPLE_ID_PASSWORD']}' " \
+    "--team-id '#{ENV['APPLE_TEAM_ID']}' " \
+    "--output-format json",
+    log: false
+  )
+  submission_id = JSON.parse(submit_out)["id"]
+  UI.message("Submission ID: #{submission_id}")
+
+  status = nil
+  80.times do |i|
+    sleep(15)
+    info_out = sh(
+      "xcrun notarytool info '#{submission_id}' " \
+      "--apple-id '#{ENV['APPLE_ID']}' " \
+      "--password '#{ENV['APPLE_ID_PASSWORD']}' " \
+      "--team-id '#{ENV['APPLE_TEAM_ID']}' " \
+      "--output-format json",
+      log: false
+    )
+    status = JSON.parse(info_out)["status"]
+    UI.message("[#{i + 1}/80] Status: #{status}")
+    break if status == "Accepted"
+    UI.user_error!("Notarization failed") if status == "Invalid"
+  end
+  UI.user_error!("Notarization timed out") unless status == "Accepted"
+
+  sh("xcrun stapler staple '#{app_bundle}'")
+  FileUtils.rm_f(zip_path)
+  UI.success("Notarized and stapled")
+end
+
+def create_dmg
+  build_dir = File.expand_path("../build", Dir.pwd)
+  app_bundle = File.join(build_dir, "#{APP_NAME}.app")
+  dmg_path = File.join(build_dir, "#{APP_NAME}.dmg")
+  staging = File.join(build_dir, "dmg-staging")
+
+  FileUtils.rm_rf(staging)
+  FileUtils.rm_f(dmg_path)
+  FileUtils.mkdir_p(staging)
+
+  FileUtils.cp_r(app_bundle, staging)
+  File.symlink("/Applications", File.join(staging, "Applications"))
+
+  sh(
+    "hdiutil create -volname '#{APP_NAME}' " \
+    "-srcfolder '#{staging}' -ov -format UDZO " \
+    "'#{dmg_path}'"
+  )
+
+  FileUtils.rm_rf(staging)
+  UI.success("DMG: #{dmg_path}")
+  dmg_path
+end

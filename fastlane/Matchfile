@@ -1,0 +1,7 @@
+git_url("git@github.com:brentvatne/certificates.git")
+storage_mode("git")
+type("developer_id")
+app_identifier("com.dbmic.app")
+username("brentvatne@gmail.com")
+team_id("GQ4S96SE9Z")
+platform("macos")
