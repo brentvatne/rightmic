@@ -80,4 +80,58 @@ public struct PriorityConfig: Codable, Equatable {
     public func bestDevice(availableUIDs: Set<String>) -> PriorityEntry? {
         entries.first { $0.enabled && availableUIDs.contains($0.uid) }
     }
+
+    // MARK: - Reconciliation
+
+    /// Sync entries with the current set of connected devices.
+    ///
+    /// - Adds new devices not yet in the list
+    /// - Updates the UID of an existing entry when a device reconnects with a new
+    ///   CoreAudio UID (matched by name + transport type)
+    /// - Updates names if a device was renamed
+    /// - Removes stale disconnected duplicates (same name + transport type as a
+    ///   connected entry but with a different UID)
+    ///
+    /// - Parameter connectedDevices: The currently connected input devices.
+    /// - Parameter excludingUID: A UID to skip (e.g. the virtual device UID).
+    public mutating func reconcile(connectedDevices: [AudioDevice], excludingUID: String? = nil) {
+        let connectedUIDs = Set(connectedDevices.map(\.uid))
+        let knownUIDs = Set(entries.map(\.uid))
+
+        for device in connectedDevices {
+            if device.uid == excludingUID { continue }
+
+            if knownUIDs.contains(device.uid) {
+                // UID already known — update the name if it changed
+                if let idx = entries.firstIndex(where: { $0.uid == device.uid }),
+                   entries[idx].name != device.name {
+                    entries[idx].name = device.name
+                }
+            } else if let idx = entries.firstIndex(where: {
+                $0.name == device.name && $0.transportType == device.transportType && !connectedUIDs.contains($0.uid)
+            }) {
+                // Device reconnected with a new UID — update the existing entry in place
+                entries[idx] = PriorityEntry(
+                    uid: device.uid,
+                    name: device.name,
+                    transportType: device.transportType,
+                    enabled: entries[idx].enabled,
+                    dependsOn: entries[idx].dependsOn
+                )
+            } else {
+                entries.append(PriorityEntry(from: device))
+            }
+        }
+
+        // Remove stale duplicates: disconnected entries that share name + transport
+        // type with a currently connected entry.
+        let connectedKeys = Set(
+            entries.filter { connectedUIDs.contains($0.uid) }
+                   .map { "\($0.name)\t\($0.transportType.rawValue)" }
+        )
+        entries.removeAll { entry in
+            !connectedUIDs.contains(entry.uid)
+                && connectedKeys.contains("\(entry.name)\t\(entry.transportType.rawValue)")
+        }
+    }
 }
