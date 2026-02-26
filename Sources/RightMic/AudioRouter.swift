@@ -27,6 +27,10 @@ final class AudioRouter {
 
     /// AudioConverter for resampling when device rate != 48000 Hz.
     fileprivate var audioConverter: AudioConverterRef?
+
+    /// Native channel count of the current capture device (1 = mono, 2 = stereo).
+    /// Set during configureAudioUnit before the capture callback starts.
+    fileprivate var captureChannels: UInt32 = UInt32(RingBufferWriter.channelCount)
     /// Output buffer for the sample rate converter (48kHz data).
     fileprivate var converterOutputBuffer: UnsafeMutablePointer<Float>?
     fileprivate let converterOutputCapacity: UInt32 = 8192
@@ -294,29 +298,41 @@ final class AudioRouter {
             &deviceFormat, &formatSize
         )
         let captureRate: Float64
+        let captureChannels: UInt32
         if fmtStatus == noErr && deviceFormat.mSampleRate > 0 {
             captureRate = deviceFormat.mSampleRate
+            // Clamp to the ring buffer's channel count (mono or stereo).
+            // Per Apple TN2091, AUHAL silences extra client channels that have no
+            // corresponding hardware channel, so we must match the hardware channel count
+            // to avoid getting a silent right channel from a mono microphone.
+            captureChannels = deviceFormat.mChannelsPerFrame >= 1
+                ? min(deviceFormat.mChannelsPerFrame, UInt32(RingBufferWriter.channelCount))
+                : UInt32(RingBufferWriter.channelCount)
             NSLog("[RightMic] Device native format: %.0f Hz, %d ch, %d bits, flags=0x%X",
                   deviceFormat.mSampleRate, deviceFormat.mChannelsPerFrame,
                   deviceFormat.mBitsPerChannel, deviceFormat.mFormatFlags)
         } else {
             captureRate = 48000.0
-            NSLog("[RightMic] Could not query device format (status=%d), assuming 48kHz", fmtStatus)
+            captureChannels = UInt32(RingBufferWriter.channelCount)
+            NSLog("[RightMic] Could not query device format (status=%d), assuming 48kHz stereo", fmtStatus)
         }
+        self.captureChannels = captureChannels
+        let captureBytesPerFrame = captureChannels * 4  // 32-bit float
 
         // Set our desired format on the output (client) side of bus 1.
-        // Use the device's native sample rate to avoid -10863 errors with virtual devices.
-        // If the rate differs from 48kHz, we'll convert after rendering.
+        // Use the device's native sample rate and channel count to avoid -10863 errors
+        // with virtual devices and to prevent channel mismatches with mono hardware.
+        // Sample rate and mono→stereo upmixing are handled after rendering.
         var format = AudioStreamBasicDescription(
             mSampleRate: captureRate,
             mFormatID: kAudioFormatLinearPCM,
             mFormatFlags: kAudioFormatFlagIsFloat
                         | kAudioFormatFlagsNativeEndian
                         | kAudioFormatFlagIsPacked,
-            mBytesPerPacket: UInt32(RingBufferWriter.bytesPerFrame),
+            mBytesPerPacket: captureBytesPerFrame,
             mFramesPerPacket: 1,
-            mBytesPerFrame: UInt32(RingBufferWriter.bytesPerFrame),
-            mChannelsPerFrame: UInt32(RingBufferWriter.channelCount),
+            mBytesPerFrame: captureBytesPerFrame,
+            mChannelsPerFrame: captureChannels,
             mBitsPerChannel: 32,
             mReserved: 0
         )
@@ -346,8 +362,15 @@ final class AudioRouter {
                 AudioComponentInstanceDispose(au)
                 return false
             }
+            // Use highest quality SRC to minimise audible artefacts on non-48kHz devices.
+            var quality = UInt32(kAudioConverterQuality_Max)
+            AudioConverterSetProperty(converter,
+                                      kAudioConverterSampleRateConverterQuality,
+                                      UInt32(MemoryLayout<UInt32>.size),
+                                      &quality)
             audioConverter = converter
-            NSLog("[RightMic] Created sample rate converter: %.0f Hz -> 48000 Hz", captureRate)
+            NSLog("[RightMic] Created sample rate converter: %.0f Hz -> 48000 Hz (%d ch)",
+                  captureRate, captureChannels)
         }
 
         // Set input callback (fires when new audio is available)
@@ -452,8 +475,8 @@ private func auInputCallback(
         return noErr
     }
 
-    let channels = UInt32(RingBufferWriter.channelCount)
-    let bytesPerFrame = UInt32(RingBufferWriter.bytesPerFrame)
+    let channels = router.captureChannels
+    let bytesPerFrame = channels * 4  // 32-bit float, captureChannels wide
     let bytesNeeded = inNumberFrames * bytesPerFrame
 
     // Point an AudioBufferList at our pre-allocated buffer
@@ -505,10 +528,18 @@ private func auInputCallback(
         )
 
         if convStatus == noErr || convStatus == 100 {
+            // Upmix mono to stereo before writing so the ring buffer always receives
+            // 2-channel interleaved audio regardless of the hardware channel count.
+            if router.captureChannels == 1 {
+                upmixMonoToStereo(buffer: outBuffer, frameCount: Int(outputFrames))
+            }
             router.ringBufferWriter.write(frames: outBuffer, frameCount: Int(outputFrames))
         }
     } else {
-        // No conversion needed — write directly
+        // No conversion needed — write directly (with upmix for mono devices).
+        if router.captureChannels == 1 {
+            upmixMonoToStereo(buffer: buffer, frameCount: Int(inNumberFrames))
+        }
         router.ringBufferWriter.write(frames: buffer, frameCount: Int(inNumberFrames))
     }
 
@@ -539,8 +570,8 @@ private func converterInputCallback(
     }
 
     let toProvide = min(ioNumberDataPackets.pointee, available)
-    let channels = UInt32(RingBufferWriter.channelCount)
-    let bytesPerFrame = UInt32(RingBufferWriter.bytesPerFrame)
+    let channels = router.captureChannels
+    let bytesPerFrame = channels * 4  // 32-bit float, captureChannels wide
 
     ioData.pointee.mNumberBuffers = 1
     ioData.pointee.mBuffers.mNumberChannels = channels
@@ -553,4 +584,19 @@ private func converterInputCallback(
 
     outDataPacketDescription?.pointee = nil
     return noErr
+}
+
+// MARK: - Mono to Stereo Upmix
+
+/// Expands mono frames to stereo interleaved in-place by duplicating each sample.
+///
+/// The buffer must have capacity for at least `2 * frameCount` Float32 values.
+/// Works backwards through the array so source samples are never overwritten
+/// before they are read.
+private func upmixMonoToStereo(buffer: UnsafeMutablePointer<Float>, frameCount: Int) {
+    for i in stride(from: frameCount - 1, through: 0, by: -1) {
+        let sample = buffer[i]
+        buffer[i * 2 + 1] = sample  // R
+        buffer[i * 2]     = sample  // L
+    }
 }
