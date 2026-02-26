@@ -27,6 +27,7 @@ public final class RingBufferWriter {
 
     // MARK: - State
 
+    public let path: String
     private var fd: Int32 = -1
     private var mappedPtr: UnsafeMutableRawPointer?
     private var header: UnsafeMutablePointer<RingBufferHeader>?
@@ -44,12 +45,14 @@ public final class RingBufferWriter {
         var active: UInt32
         var sampleRate: UInt32
         var channels: UInt32
-        var _pad: (UInt32, UInt32, UInt32, UInt32, UInt32)  // 5 x UInt32 = 20 bytes
+        var _pad: (UInt32, UInt32, UInt32, UInt32, UInt32, UInt32, UInt32, UInt32, UInt32)  // 9 x UInt32 = 36 bytes → total 64
     }
 
     // MARK: - Lifecycle
 
-    public init() {}
+    public init(path: String = RingBufferWriter.sharedMemoryPath) {
+        self.path = path
+    }
 
     deinit {
         close()
@@ -60,11 +63,32 @@ public final class RingBufferWriter {
     /// Create and map the shared file for IPC with the driver.
     public func open() throws {
         guard !isOpen else { return }
+        assert(MemoryLayout<RingBufferHeader>.size == Self.headerSize,
+               "RingBufferHeader size mismatch with headerSize constant")
 
-        // Create the backing file (read-write for the app)
-        fd = Darwin.open(Self.sharedMemoryPath, O_CREAT | O_RDWR, 0o644)
+        // Create the backing file (read-write for owner only; O_NOFOLLOW prevents symlink attacks)
+        fd = Darwin.open(path, O_CREAT | O_RDWR | O_NOFOLLOW, 0o600)
         guard fd >= 0 else {
             throw RingBufferError.openFailed(errno: errno)
+        }
+
+        // Validate the opened file descriptor
+        var st = stat()
+        guard fstat(fd, &st) == 0 else {
+            let e = errno
+            Darwin.close(fd)
+            fd = -1
+            throw RingBufferError.fstatFailed(errno: e)
+        }
+        guard (st.st_mode & S_IFMT) == S_IFREG else {
+            Darwin.close(fd)
+            fd = -1
+            throw RingBufferError.notRegularFile
+        }
+        guard st.st_uid == getuid() else {
+            Darwin.close(fd)
+            fd = -1
+            throw RingBufferError.ownerMismatch
         }
 
         // Set size
@@ -103,6 +127,9 @@ public final class RingBufferWriter {
         }
 
         if let ptr = mappedPtr {
+            // Zero all audio data to prevent residual leakage
+            memset(ptr, 0, Self.totalSize)
+            msync(ptr, Self.totalSize, MS_SYNC)
             munmap(ptr, Self.totalSize)
             mappedPtr = nil
         }
@@ -119,7 +146,7 @@ public final class RingBufferWriter {
     /// Remove the shared file from disk.
     /// Call this when the app exits to clean up.
     public func unlink() {
-        Darwin.unlink(Self.sharedMemoryPath)
+        Darwin.unlink(path)
     }
 
     // MARK: - Write
@@ -169,12 +196,18 @@ public final class RingBufferWriter {
 
     public enum RingBufferError: Error, CustomStringConvertible {
         case openFailed(errno: Int32)
+        case fstatFailed(errno: Int32)
+        case notRegularFile
+        case ownerMismatch
         case ftruncateFailed(errno: Int32)
         case mmapFailed(errno: Int32)
 
         public var description: String {
             switch self {
             case .openFailed(let e):      return "open failed: \(String(cString: strerror(e)))"
+            case .fstatFailed(let e):     return "fstat failed: \(String(cString: strerror(e)))"
+            case .notRegularFile:         return "shared memory path is not a regular file"
+            case .ownerMismatch:          return "shared memory file owned by another user"
             case .ftruncateFailed(let e): return "ftruncate failed: \(String(cString: strerror(e)))"
             case .mmapFailed(let e):      return "mmap failed: \(String(cString: strerror(e)))"
             }

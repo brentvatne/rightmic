@@ -44,9 +44,9 @@ static os_log_t sLog;
 #pragma mark - Driver State
 
 static AudioServerPlugInHostInterface const * sHost       = NULL;
-static UInt32                                  sRefCount   = 0;
-static Boolean                                 sDeviceIsRunning = false;
-static UInt32                                  sClientCount = 0;
+static _Atomic UInt32                          sRefCount   = 0;
+static _Atomic Boolean                         sDeviceIsRunning = false;
+static _Atomic UInt32                          sClientCount = 0;
 
 /* Timestamp state */
 static mach_timebase_info_data_t sTimebaseInfo;
@@ -149,7 +149,7 @@ void *RightMic_Create(CFAllocatorRef allocator, CFUUIDRef typeUUID)
     }
 
     LOG_INFO("Driver factory invoked");
-    sRefCount = 1;
+    atomic_store(&sRefCount, 1);
     return &gDriverInterfacePtr;
 }
 
@@ -167,7 +167,7 @@ static HRESULT RightMic_QueryInterface(void *inDriver, REFIID inUUID, LPVOID *ou
     CFRelease(cfUUID);
 
     if (isIUnknown || isPlugin) {
-        sRefCount++;
+        atomic_fetch_add(&sRefCount, 1);
         *outInterface = inDriver;
         return S_OK;
     }
@@ -179,14 +179,15 @@ static HRESULT RightMic_QueryInterface(void *inDriver, REFIID inUUID, LPVOID *ou
 static ULONG RightMic_AddRef(void *inDriver)
 {
     (void)inDriver;
-    return ++sRefCount;
+    return atomic_fetch_add(&sRefCount, 1) + 1;
 }
 
 static ULONG RightMic_Release(void *inDriver)
 {
     (void)inDriver;
-    if (sRefCount > 0) sRefCount--;
-    return sRefCount;
+    UInt32 old = atomic_load(&sRefCount);
+    if (old > 0) old = atomic_fetch_sub(&sRefCount, 1) - 1;
+    return old;
 }
 
 /* ================================================================
@@ -227,8 +228,8 @@ static OSStatus RightMic_AddDeviceClient(AudioServerPlugInDriverRef inDriver, Au
                                           const AudioServerPlugInClientInfo *inClientInfo)
 {
     (void)inDriver; (void)inDeviceObjectID; (void)inClientInfo;
-    sClientCount++;
-    LOG_INFO("Client added (total: %u)", sClientCount);
+    UInt32 count = atomic_fetch_add(&sClientCount, 1) + 1;
+    LOG_INFO("Client added (total: %u)", count);
     return kAudioHardwareNoError;
 }
 
@@ -236,8 +237,9 @@ static OSStatus RightMic_RemoveDeviceClient(AudioServerPlugInDriverRef inDriver,
                                              const AudioServerPlugInClientInfo *inClientInfo)
 {
     (void)inDriver; (void)inDeviceObjectID; (void)inClientInfo;
-    if (sClientCount > 0) sClientCount--;
-    LOG_INFO("Client removed (total: %u)", sClientCount);
+    UInt32 old = atomic_load(&sClientCount);
+    UInt32 count = (old > 0) ? (atomic_fetch_sub(&sClientCount, 1) - 1) : 0;
+    LOG_INFO("Client removed (total: %u)", count);
     return kAudioHardwareNoError;
 }
 
@@ -688,7 +690,7 @@ static OSStatus RightMic_GetPropertyData(AudioServerPlugInDriverRef inDriver, Au
         case kAudioDevicePropertyDeviceIsRunning:
             if (inDataSize < sizeof(UInt32)) return kAudioHardwareBadPropertySizeError;
             *outDataSize = sizeof(UInt32);
-            *(UInt32 *)outData = sDeviceIsRunning ? 1 : 0;
+            *(UInt32 *)outData = atomic_load(&sDeviceIsRunning) ? 1 : 0;
             return kAudioHardwareNoError;
 
         case kAudioDevicePropertyDeviceCanBeDefaultDevice:
@@ -939,17 +941,23 @@ static void RightMic_OpenSharedMemory(void)
 {
     if (sShm_Ptr != MAP_FAILED) return; /* already open */
 
-    sShm_FD = open(kRightMic_SharedMemoryPath, O_RDONLY);
+    sShm_FD = open(kRightMic_SharedMemoryPath, O_RDONLY | O_NOFOLLOW);
     if (sShm_FD < 0) {
         LOG_INFO("Shared memory file not yet created by companion app");
         return;
     }
 
-    /* Verify the file is the expected size before mapping */
+    /* Verify the file is the expected size and is a regular file */
     struct stat st;
     if (fstat(sShm_FD, &st) != 0 || st.st_size < (off_t)kRightMic_SharedMemorySize) {
         LOG_INFO("Shared memory file too small (%lld bytes, need %lu), retrying later",
                  (long long)st.st_size, (unsigned long)kRightMic_SharedMemorySize);
+        close(sShm_FD);
+        sShm_FD = -1;
+        return;
+    }
+    if (!S_ISREG(st.st_mode)) {
+        LOG_ERROR("Shared memory path is not a regular file, refusing to map");
         close(sShm_FD);
         sShm_FD = -1;
         return;
@@ -1001,7 +1009,7 @@ static OSStatus RightMic_StartIO(AudioServerPlugInDriverRef inDriver, AudioObjec
     sLocalReadHead = 0;
     RightMic_OpenSharedMemory();
 
-    sDeviceIsRunning = true;
+    atomic_store(&sDeviceIsRunning, true);
     LOG_INFO("IO started (client %u)", inClientID);
     return kAudioHardwareNoError;
 }
@@ -1010,7 +1018,7 @@ static OSStatus RightMic_StopIO(AudioServerPlugInDriverRef inDriver, AudioObject
 {
     (void)inDriver; (void)inDeviceObjectID; (void)inClientID;
 
-    sDeviceIsRunning = false;
+    atomic_store(&sDeviceIsRunning, false);
     RightMic_CloseSharedMemory();
     LOG_INFO("IO stopped (client %u)", inClientID);
     return kAudioHardwareNoError;
