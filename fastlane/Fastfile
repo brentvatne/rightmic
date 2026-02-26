@@ -29,16 +29,24 @@ platform :mac do
   lane :release do |options|
     version = (ENV["GITHUB_REF_NAME"] || "v1.0.0").sub(/^v/, "")
 
-    # Build
-    build
+    # Build binaries (driver unsigned — we sign it before bundling)
+    sh("cd .. && swift build -c release --arch arm64 --arch x86_64")
+    sh("cd .. && ./scripts/build-driver.sh --no-sign")
 
-    # Sign
+    # Sign driver first, so the signed copy gets bundled into the .app
     identity = options[:signing_identity] || find_signing_identity
     if identity
       sign_driver(identity: identity)
-      sign_app(identity: identity)
     else
       UI.important("No signing identity found — skipping code signing")
+    end
+
+    # Assemble .app (copies the now-signed driver into Resources/)
+    assemble_app_bundle
+
+    # Sign the .app bundle
+    if identity
+      sign_app(identity: identity)
     end
 
     # Create .pkg installer
