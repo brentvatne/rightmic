@@ -61,11 +61,26 @@ jobs:
           MATCH_KEYCHAIN_PASSWORD: ${{ secrets.MATCH_PASSWORD }}
         run: bundle exec fastlane match developer_id --readonly
 
+      - name: Import Developer ID Installer certificate
+        env:
+          INSTALLER_CERT_BASE64: ${{ secrets.INSTALLER_CERT_BASE64 }}
+          INSTALLER_CERT_PASSWORD: ${{ secrets.INSTALLER_CERT_PASSWORD }}
+          KEYCHAIN_PASSWORD: ${{ secrets.MATCH_PASSWORD }}
+        run: |
+          if [[ -z "${INSTALLER_CERT_BASE64:-}" ]]; then
+            echo "No INSTALLER_CERT_BASE64 secret set — .pkg will be unsigned"
+            exit 0
+          fi
+          echo "$INSTALLER_CERT_BASE64" | base64 --decode > /tmp/installer-cert.p12
+          security import /tmp/installer-cert.p12 -k build.keychain \
+            -P "$INSTALLER_CERT_PASSWORD" -T /usr/bin/productsign -T /usr/bin/codesign
+          rm /tmp/installer-cert.p12
+
       - name: Allow codesign to access keychain
         env:
           KEYCHAIN_PASSWORD: ${{ secrets.MATCH_PASSWORD }}
         run: |
-          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KEYCHAIN_PASSWORD" build.keychain
+          security set-key-partition-list -S apple-tool:,apple:,codesign:,productsign:,productbuild: -s -k "$KEYCHAIN_PASSWORD" build.keychain
 
       - name: Build, sign, notarize, and package
         env:
@@ -81,5 +96,5 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           name: RightMic v${{ env.VERSION }}
-          files: build/RightMic.dmg
+          files: build/RightMic.pkg
           generate_release_notes: true

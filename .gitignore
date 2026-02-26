@@ -24,6 +24,7 @@ Package.resolved
 # App bundle
 *.app
 *.dmg
+*.pkg
 
 # Environment
 .env

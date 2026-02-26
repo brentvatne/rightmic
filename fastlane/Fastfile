@@ -4,6 +4,7 @@ default_platform(:mac)
 
 APP_NAME = "RightMic"
 BUNDLE_ID = "com.rightmic.app"
+DRIVER_ID = "com.rightmic.driver"
 ENTITLEMENTS = "Sources/RightMic/RightMic.entitlements"
 INFO_PLIST = "Sources/RightMic/Info.plist"
 
@@ -17,75 +18,78 @@ platform :mac do
     )
   end
 
-  desc "Build the release binary and assemble .app bundle"
+  desc "Build the release binary, HAL driver, and assemble .app bundle"
   lane :build do
     sh("cd .. && swift build -c release --arch arm64 --arch x86_64")
+    sh("cd .. && ./scripts/build-driver.sh --no-sign")
     assemble_app_bundle
   end
 
-  desc "Build, sign, notarize, and create DMG"
+  desc "Build, sign, notarize, and create .pkg installer"
   lane :release do |options|
+    version = (ENV["GITHUB_REF_NAME"] || "v1.0.0").sub(/^v/, "")
+
     # Build
     build
 
     # Sign
-    if options[:signing_identity]
-      sign_app(identity: options[:signing_identity])
+    identity = options[:signing_identity] || find_signing_identity
+    if identity
+      sign_driver(identity: identity)
+      sign_app(identity: identity)
     else
-      # Try to get cert from keychain (CI imports it before this lane)
-      identity = find_signing_identity
-      sign_app(identity: identity) if identity
+      UI.important("No signing identity found — skipping code signing")
     end
 
-    # Notarize (only if signed)
-    identity = find_signing_identity
+    # Create .pkg installer
+    create_pkg(version: version)
+
+    # Sign .pkg with Developer ID Installer
+    installer_identity = find_installer_identity
+    if installer_identity
+      sign_pkg(identity: installer_identity)
+    else
+      UI.important("No Developer ID Installer cert found — .pkg is unsigned")
+    end
+
+    # Notarize
     if identity && ENV["APPLE_ID"]
-      notarize_app
+      notarize_pkg
     else
       UI.important("Skipping notarization (no signing identity or Apple ID)")
     end
-
-    # Package
-    create_dmg
   end
 
   desc "Set up GitHub secrets for CI (interactive)"
   lane :setup_ci_secrets do
     require "open3"
 
-    # Ensure gh is available
     unless system("gh auth status > /dev/null 2>&1")
       UI.user_error!("GitHub CLI not authenticated. Run: gh auth login")
     end
 
-    # Create cert if needed
     setup_cert
 
-    # Find the cert
     identity = find_signing_identity
     UI.user_error!("No Developer ID certificate found") unless identity
 
     team_id = identity.match(/\(([A-Z0-9]+)\)/)&.captures&.first
     UI.user_error!("Could not extract Team ID from: #{identity}") unless team_id
 
-    # Export .p12
     UI.message("Exporting certificate...")
     p12_path = File.join(Dir.tmpdir, "RightMic-cert.p12")
     p12_password = UI.password("Choose a password for the .p12 export: ")
 
-    # Export via security command
     sh("security export -k login.keychain-db -t identities -f pkcs12 -o '#{p12_path}' -P '#{p12_password}'")
 
     cert_base64 = Base64.strict_encode64(File.read(p12_path))
 
-    # Get Apple ID for notarization
     apple_id = UI.input("Apple ID (email): ")
     UI.message("You need an app-specific password for notarization.")
     UI.message("Create one at: https://appleid.apple.com/account/manage/section/security")
     sh("open 'https://appleid.apple.com/account/manage/section/security'") rescue nil
     apple_id_password = UI.password("App-specific password: ")
 
-    # Set GitHub secrets
     Dir.chdir("..") do
       [
         ["DEVELOPER_ID_CERT_BASE64", cert_base64],
@@ -132,6 +136,12 @@ def assemble_app_bundle
     FileUtils.cp_r(resource_bundle, File.join(contents, "Resources/"))
   end
 
+  # Bundle the HAL driver inside the app (for manual installation fallback)
+  driver_bundle = File.join(build_dir, "RightMic.driver")
+  if File.directory?(driver_bundle)
+    FileUtils.cp_r(driver_bundle, File.join(contents, "Resources/RightMic.driver"))
+  end
+
   UI.success("App bundle: #{app_bundle}")
   app_bundle
 end
@@ -142,11 +152,30 @@ def find_signing_identity
   match ? match[1] : nil
 end
 
+def find_installer_identity
+  output = sh("security find-identity -v", log: false) rescue ""
+  match = output.match(/"(Developer ID Installer: .+)"/)
+  match ? match[1] : nil
+end
+
+def sign_driver(identity:)
+  driver_bundle = File.expand_path("../build/RightMic.driver", Dir.pwd)
+
+  UI.message("Signing driver with: #{identity}")
+  sh(
+    "codesign --force --options runtime " \
+    "--sign '#{identity}' " \
+    "'#{driver_bundle}'"
+  )
+  sh("codesign --verify --verbose=2 '#{driver_bundle}'")
+  UI.success("Driver signed and verified")
+end
+
 def sign_app(identity:)
   app_bundle = File.expand_path("../build/#{APP_NAME}.app", Dir.pwd)
   entitlements = File.expand_path("../#{ENTITLEMENTS}", Dir.pwd)
 
-  UI.message("Signing with: #{identity}")
+  UI.message("Signing app with: #{identity}")
   sh(
     "codesign --deep --force --options runtime " \
     "--sign '#{identity}' " \
@@ -154,20 +183,34 @@ def sign_app(identity:)
     "'#{app_bundle}'"
   )
   sh("codesign --verify --verbose=2 '#{app_bundle}'")
-  UI.success("Signed and verified")
+  UI.success("App signed and verified")
 end
 
-def notarize_app
-  app_bundle = File.expand_path("../build/#{APP_NAME}.app", Dir.pwd)
-  zip_path = File.expand_path("../build/#{APP_NAME}-notarize.zip", Dir.pwd)
+def create_pkg(version: "1.0.0")
+  sh("cd .. && VERSION='#{version}' ./scripts/create-pkg.sh")
+  UI.success("PKG created")
+end
 
-  sh("cd '#{File.dirname(app_bundle)}' && zip -r '#{zip_path}' '#{APP_NAME}.app'")
+def sign_pkg(identity:)
+  build_dir = File.expand_path("../build", Dir.pwd)
+  unsigned = File.join(build_dir, "RightMic.pkg")
+  signed = File.join(build_dir, "RightMic-signed.pkg")
+
+  UI.message("Signing .pkg with: #{identity}")
+  sh("productsign --sign '#{identity}' '#{unsigned}' '#{signed}'")
+  FileUtils.rm_f(unsigned)
+  FileUtils.mv(signed, unsigned)
+  UI.success("PKG signed")
+end
+
+def notarize_pkg
+  pkg_path = File.expand_path("../build/RightMic.pkg", Dir.pwd)
 
   require "json"
 
-  UI.message("Submitting #{zip_path} for notarization...")
+  UI.message("Submitting #{pkg_path} for notarization...")
   submit_out = sh(
-    "xcrun notarytool submit '#{zip_path}' " \
+    "xcrun notarytool submit '#{pkg_path}' " \
     "--apple-id '#{ENV['APPLE_ID']}' " \
     "--password '#{ENV['APPLE_ID_PASSWORD']}' " \
     "--team-id '#{ENV['APPLE_TEAM_ID']}' " \
@@ -195,31 +238,6 @@ def notarize_app
   end
   UI.user_error!("Notarization timed out") unless status == "Accepted"
 
-  sh("xcrun stapler staple '#{app_bundle}'")
-  FileUtils.rm_f(zip_path)
+  sh("xcrun stapler staple '#{pkg_path}'")
   UI.success("Notarized and stapled")
-end
-
-def create_dmg
-  build_dir = File.expand_path("../build", Dir.pwd)
-  app_bundle = File.join(build_dir, "#{APP_NAME}.app")
-  dmg_path = File.join(build_dir, "#{APP_NAME}.dmg")
-  staging = File.join(build_dir, "dmg-staging")
-
-  FileUtils.rm_rf(staging)
-  FileUtils.rm_f(dmg_path)
-  FileUtils.mkdir_p(staging)
-
-  FileUtils.cp_r(app_bundle, staging)
-  File.symlink("/Applications", File.join(staging, "Applications"))
-
-  sh(
-    "hdiutil create -volname '#{APP_NAME}' " \
-    "-srcfolder '#{staging}' -ov -format UDZO " \
-    "'#{dmg_path}'"
-  )
-
-  FileUtils.rm_rf(staging)
-  UI.success("DMG: #{dmg_path}")
-  dmg_path
 end
