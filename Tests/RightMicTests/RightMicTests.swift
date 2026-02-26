@@ -213,6 +213,10 @@ final class PriorityConfigTests: XCTestCase {
 
 final class RingBufferWriterTests: XCTestCase {
 
+    private func tempPath() -> String {
+        NSTemporaryDirectory() + "com.rightmic.test.\(UUID().uuidString)"
+    }
+
     func testConstants() {
         XCTAssertEqual(RingBufferWriter.channelCount, 2)
         XCTAssertEqual(RingBufferWriter.bytesPerFrame, 8)  // 2 channels * 4 bytes
@@ -223,14 +227,15 @@ final class RingBufferWriterTests: XCTestCase {
     }
 
     func testOpenAndClose() throws {
-        let writer = RingBufferWriter()
+        let path = tempPath()
+        let writer = RingBufferWriter(path: path)
         XCTAssertFalse(writer.isOpen)
 
         try writer.open()
         XCTAssertTrue(writer.isOpen)
 
         // Verify the backing file was created
-        XCTAssertTrue(FileManager.default.fileExists(atPath: RingBufferWriter.sharedMemoryPath))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: path))
 
         writer.close()
         XCTAssertFalse(writer.isOpen)
@@ -239,7 +244,8 @@ final class RingBufferWriterTests: XCTestCase {
     }
 
     func testDoubleOpenIsNoOp() throws {
-        let writer = RingBufferWriter()
+        let path = tempPath()
+        let writer = RingBufferWriter(path: path)
         try writer.open()
         try writer.open()  // should not throw
         XCTAssertTrue(writer.isOpen)
@@ -248,7 +254,8 @@ final class RingBufferWriterTests: XCTestCase {
     }
 
     func testWriteFrames() throws {
-        let writer = RingBufferWriter()
+        let path = tempPath()
+        let writer = RingBufferWriter(path: path)
         try writer.open()
 
         // Write 512 frames of silence
@@ -270,12 +277,121 @@ final class RingBufferWriterTests: XCTestCase {
     }
 
     func testUnlink() throws {
-        let writer = RingBufferWriter()
+        let path = tempPath()
+        let writer = RingBufferWriter(path: path)
         try writer.open()
         writer.close()
         writer.unlink()
 
-        XCTAssertFalse(FileManager.default.fileExists(atPath: RingBufferWriter.sharedMemoryPath))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: path))
+    }
+
+    // MARK: - Security Tests
+
+    func testFilePermissionsAreRestrictive() throws {
+        let path = tempPath()
+        let writer = RingBufferWriter(path: path)
+        try writer.open()
+        defer { writer.close(); writer.unlink() }
+
+        let attrs = try FileManager.default.attributesOfItem(atPath: path)
+        let posix = (attrs[.posixPermissions] as! NSNumber).uint16Value
+        XCTAssertEqual(posix, 0o600, "File should be owner-only read/write (0600), got \(String(posix, radix: 8))")
+    }
+
+    func testOpenRejectsSymlink() throws {
+        let target = tempPath()
+        let link = tempPath()
+
+        // Create a real file, then a symlink to it
+        FileManager.default.createFile(atPath: target, contents: nil)
+        defer { unlink(target); unlink(link) }
+        try FileManager.default.createSymbolicLink(atPath: link, withDestinationPath: target)
+
+        let writer = RingBufferWriter(path: link)
+        XCTAssertThrowsError(try writer.open()) { error in
+            guard let rbError = error as? RingBufferWriter.RingBufferError,
+                  case .openFailed(let e) = rbError else {
+                XCTFail("Expected openFailed with ELOOP, got \(error)")
+                return
+            }
+            XCTAssertEqual(e, ELOOP, "Expected ELOOP (\(ELOOP)), got \(e)")
+        }
+    }
+
+    func testHeaderStructSizeMatchesConstant() {
+        XCTAssertEqual(MemoryLayout<RingBufferWriter.RingBufferHeader>.size, RingBufferWriter.headerSize,
+                       "Swift RingBufferHeader size must match headerSize constant (64 bytes)")
+    }
+
+    func testAudioDataZeroedOnClose() throws {
+        let path = tempPath()
+        let writer = RingBufferWriter(path: path)
+        try writer.open()
+
+        // Write non-zero audio data
+        let frameCount = 512
+        let sampleCount = frameCount * RingBufferWriter.channelCount
+        var samples = [Float](repeating: 1.0, count: sampleCount)
+        writer.write(frames: &samples, frameCount: frameCount)
+
+        writer.close()
+        defer { unlink(path) }
+
+        // Read raw file contents and verify all bytes are zero
+        let data = try Data(contentsOf: URL(fileURLWithPath: path))
+        let nonZero = data.contains { $0 != 0 }
+        XCTAssertFalse(nonZero, "File should be all zeros after close")
+    }
+
+    func testCustomPathIsolation() throws {
+        let path1 = tempPath()
+        let path2 = tempPath()
+        let writer1 = RingBufferWriter(path: path1)
+        let writer2 = RingBufferWriter(path: path2)
+        defer { writer1.close(); writer1.unlink(); writer2.close(); writer2.unlink() }
+
+        try writer1.open()
+        try writer2.open()
+
+        // Write different data to each
+        var ones = [Float](repeating: 1.0, count: RingBufferWriter.channelCount)
+        var twos = [Float](repeating: 2.0, count: RingBufferWriter.channelCount)
+        writer1.write(frames: &ones, frameCount: 1)
+        writer2.write(frames: &twos, frameCount: 1)
+
+        XCTAssertTrue(writer1.isOpen)
+        XCTAssertTrue(writer2.isOpen)
+        XCTAssertNotEqual(path1, path2)
+    }
+
+    func testOpenRejectsNonRegularFile() throws {
+        let fifoPath = tempPath()
+        defer { unlink(fifoPath) }
+
+        // Create a FIFO (named pipe)
+        let result = mkfifo(fifoPath, 0o600)
+        guard result == 0 else {
+            XCTFail("Failed to create FIFO: \(String(cString: strerror(errno)))")
+            return
+        }
+
+        let writer = RingBufferWriter(path: fifoPath)
+        XCTAssertThrowsError(try writer.open()) { error in
+            guard let rbError = error as? RingBufferWriter.RingBufferError else {
+                XCTFail("Expected RingBufferError, got \(error)")
+                return
+            }
+            // O_NONBLOCK isn't set, so open() on a FIFO may block or fail.
+            // With O_RDWR on a FIFO, open succeeds but fstat shows it's not S_IFREG.
+            if case .notRegularFile = rbError {
+                // Expected
+            } else if case .openFailed = rbError {
+                // Also acceptable — some systems may reject O_CREAT on existing FIFO
+            } else {
+                XCTFail("Expected notRegularFile or openFailed, got \(rbError)")
+            }
+        }
     }
 }
 

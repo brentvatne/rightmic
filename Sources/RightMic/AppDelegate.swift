@@ -18,6 +18,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSLog("[RightMic] applicationDidFinishLaunching")
+        cleanupStaleSharedMemory()
         setupStatusItem()
         setupPopover()
         setupEventMonitor()
@@ -30,6 +31,33 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationWillTerminate(_ notification: Notification) {
         audioRouter?.shutdown()
+    }
+
+    // MARK: - Stale Shared Memory Cleanup
+
+    /// Remove any leftover shared memory file from a previous crash.
+    /// Zeroes the contents before unlinking to prevent residual audio leakage.
+    private func cleanupStaleSharedMemory() {
+        let path = RingBufferWriter.sharedMemoryPath
+        let fm = FileManager.default
+        guard fm.fileExists(atPath: path) else { return }
+
+        NSLog("[RightMic] Found stale shared memory file, cleaning up")
+        let fd = Darwin.open(path, O_RDWR | O_NOFOLLOW)
+        if fd >= 0 {
+            var st = stat()
+            if fstat(fd, &st) == 0 && (st.st_mode & S_IFMT) == S_IFREG && st.st_size > 0 {
+                let size = Int(st.st_size)
+                let ptr = mmap(nil, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0)
+                if ptr != MAP_FAILED {
+                    memset(ptr, 0, size)
+                    msync(ptr, size, MS_SYNC)
+                    munmap(ptr, size)
+                }
+            }
+            Darwin.close(fd)
+        }
+        unlink(path)
     }
 
     // MARK: - Status Item

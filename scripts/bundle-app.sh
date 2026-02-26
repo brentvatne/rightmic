@@ -24,8 +24,11 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-echo "==> Building release binary..."
+echo "==> Running tests..."
 cd "$PROJECT_DIR"
+swift test
+
+echo "==> Building release binary..."
 swift build -c release --arch arm64 --arch x86_64
 
 BINARY="$(swift build -c release --arch arm64 --arch x86_64 --show-bin-path)/RightMic"
