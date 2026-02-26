@@ -12,6 +12,7 @@
 #include "RightMicDriver.h"
 
 #include <CoreAudio/AudioServerPlugIn.h>
+#include <CoreAudio/AudioHardware.h>
 #include <CoreFoundation/CoreFoundation.h>
 #include <mach/mach_time.h>
 #include <os/log.h>
@@ -317,6 +318,7 @@ static Boolean RightMic_HasProperty(AudioServerPlugInDriverRef inDriver, AudioOb
         case kAudioObjectPropertyBaseClass:
         case kAudioObjectPropertyClass:
         case kAudioObjectPropertyOwner:
+        case kAudioObjectPropertyOwnedObjects:
         case kAudioObjectPropertyName:
         case kAudioObjectPropertyManufacturer:
         case kAudioDevicePropertyDeviceUID:
@@ -333,10 +335,13 @@ static Boolean RightMic_HasProperty(AudioServerPlugInDriverRef inDriver, AudioOb
         case kAudioObjectPropertyControlList:
         case kAudioDevicePropertyNominalSampleRate:
         case kAudioDevicePropertyAvailableNominalSampleRates:
+        case kAudioDevicePropertyBufferFrameSize:
+        case kAudioDevicePropertyBufferFrameSizeRange:
         case kAudioDevicePropertyZeroTimeStampPeriod:
         case kAudioDevicePropertySafetyOffset:
         case kAudioDevicePropertyClockIsStable:
         case kAudioDevicePropertyIsHidden:
+        case kAudioDevicePropertyPreferredChannelsForStereo:
             return true;
         }
         break;
@@ -385,7 +390,8 @@ static OSStatus RightMic_IsPropertySettable(AudioServerPlugInDriverRef inDriver,
        advertise is the nominal sample rate (though we only support one). */
     switch (inObjectID) {
     case kRightMicObjectID_Device:
-        if (inAddress->mSelector == kAudioDevicePropertyNominalSampleRate) {
+        if (inAddress->mSelector == kAudioDevicePropertyNominalSampleRate ||
+            inAddress->mSelector == kAudioDevicePropertyBufferFrameSize) {
             *outIsSettable = true;
             return kAudioHardwareNoError;
         }
@@ -457,6 +463,7 @@ static OSStatus RightMic_GetPropertyDataSize(AudioServerPlugInDriverRef inDriver
         case kAudioDevicePropertySafetyOffset:
         case kAudioDevicePropertyZeroTimeStampPeriod:
         case kAudioDevicePropertyTransportType:
+        case kAudioDevicePropertyBufferFrameSize:
             *outDataSize = sizeof(UInt32);
             return kAudioHardwareNoError;
         case kAudioObjectPropertyName:
@@ -467,6 +474,14 @@ static OSStatus RightMic_GetPropertyDataSize(AudioServerPlugInDriverRef inDriver
             return kAudioHardwareNoError;
         case kAudioDevicePropertyRelatedDevices:
             *outDataSize = sizeof(AudioObjectID);
+            return kAudioHardwareNoError;
+        case kAudioObjectPropertyOwnedObjects:
+            if (inAddress->mScope == kAudioObjectPropertyScopeInput ||
+                inAddress->mScope == kAudioObjectPropertyScopeGlobal) {
+                *outDataSize = sizeof(AudioObjectID); /* 1 input stream */
+            } else {
+                *outDataSize = 0;
+            }
             return kAudioHardwareNoError;
         case kAudioDevicePropertyDeviceIsAlive:
         case kAudioDevicePropertyDeviceIsRunning:
@@ -491,7 +506,11 @@ static OSStatus RightMic_GetPropertyDataSize(AudioServerPlugInDriverRef inDriver
             *outDataSize = sizeof(Float64);
             return kAudioHardwareNoError;
         case kAudioDevicePropertyAvailableNominalSampleRates:
+        case kAudioDevicePropertyBufferFrameSizeRange:
             *outDataSize = sizeof(AudioValueRange);
+            return kAudioHardwareNoError;
+        case kAudioDevicePropertyPreferredChannelsForStereo:
+            *outDataSize = 2 * sizeof(UInt32);
             return kAudioHardwareNoError;
         }
         break;
@@ -675,8 +694,8 @@ static OSStatus RightMic_GetPropertyData(AudioServerPlugInDriverRef inDriver, Au
         case kAudioDevicePropertyDeviceCanBeDefaultDevice:
             if (inDataSize < sizeof(UInt32)) return kAudioHardwareBadPropertySizeError;
             *outDataSize = sizeof(UInt32);
-            /* Allow as default input device only */
-            *(UInt32 *)outData = (inAddress->mScope == kAudioObjectPropertyScopeInput) ? 1 : 0;
+            /* Allow as default input device (return 1 for input and global scope, 0 for output) */
+            *(UInt32 *)outData = (inAddress->mScope != kAudioObjectPropertyScopeOutput) ? 1 : 0;
             return kAudioHardwareNoError;
 
         case kAudioDevicePropertyDeviceCanBeDefaultSystemDevice:
@@ -743,6 +762,39 @@ static OSStatus RightMic_GetPropertyData(AudioServerPlugInDriverRef inDriver, Au
             if (inDataSize < sizeof(UInt32)) return kAudioHardwareBadPropertySizeError;
             *outDataSize = sizeof(UInt32);
             *(UInt32 *)outData = 0; /* visible */
+            return kAudioHardwareNoError;
+
+        case kAudioDevicePropertyBufferFrameSize:
+            if (inDataSize < sizeof(UInt32)) return kAudioHardwareBadPropertySizeError;
+            *outDataSize = sizeof(UInt32);
+            *(UInt32 *)outData = kRightMic_BufferFrameSize;
+            return kAudioHardwareNoError;
+
+        case kAudioDevicePropertyBufferFrameSizeRange: {
+            if (inDataSize < sizeof(AudioValueRange)) return kAudioHardwareBadPropertySizeError;
+            *outDataSize = sizeof(AudioValueRange);
+            AudioValueRange *range = (AudioValueRange *)outData;
+            range->mMinimum = kRightMic_BufferFrameSize;
+            range->mMaximum = kRightMic_BufferFrameSize;
+            return kAudioHardwareNoError;
+        }
+
+        case kAudioObjectPropertyOwnedObjects:
+            if (inAddress->mScope == kAudioObjectPropertyScopeInput ||
+                inAddress->mScope == kAudioObjectPropertyScopeGlobal) {
+                if (inDataSize < sizeof(AudioObjectID)) return kAudioHardwareBadPropertySizeError;
+                *outDataSize = sizeof(AudioObjectID);
+                *(AudioObjectID *)outData = kRightMicObjectID_InputStream;
+            } else {
+                *outDataSize = 0;
+            }
+            return kAudioHardwareNoError;
+
+        case kAudioDevicePropertyPreferredChannelsForStereo:
+            if (inDataSize < 2 * sizeof(UInt32)) return kAudioHardwareBadPropertySizeError;
+            *outDataSize = 2 * sizeof(UInt32);
+            ((UInt32 *)outData)[0] = 1;
+            ((UInt32 *)outData)[1] = 2;
             return kAudioHardwareNoError;
         }
         break;
@@ -846,6 +898,10 @@ static OSStatus RightMic_SetPropertyData(AudioServerPlugInDriverRef inDriver, Au
                 LOG_ERROR("Unsupported sample rate: %f", requested);
                 return kAudioDeviceUnsupportedFormatError;
             }
+            return kAudioHardwareNoError;
+        }
+        if (inAddress->mSelector == kAudioDevicePropertyBufferFrameSize) {
+            /* Accept any requested buffer size (we always use our fixed size) */
             return kAudioHardwareNoError;
         }
         break;
@@ -1031,12 +1087,19 @@ static OSStatus RightMic_DoIOOperation(AudioServerPlugInDriverRef inDriver, Audi
     if (sRingHeader != NULL && atomic_load_explicit(&sRingHeader->active, memory_order_acquire)) {
         uint64_t wHead = atomic_load_explicit(&sRingHeader->writeHead, memory_order_acquire);
 
-        /* Sync local read head to writer on first IO or after a reset */
-        if (sLocalReadHead == 0 && wHead > 0) {
-            sLocalReadHead = (wHead > framesToFill) ? (wHead - framesToFill) : 0;
+        /* Sync local read head to writer on first IO or after a reset.
+         * The app resets writeHead to 0 when switching devices, so if
+         * writeHead is behind our read position, re-sync immediately
+         * instead of waiting for it to catch up (which takes ~45s). */
+        if (sLocalReadHead == 0 || wHead < sLocalReadHead) {
+            if (wHead > framesToFill) {
+                sLocalReadHead = wHead - framesToFill;
+            } else {
+                sLocalReadHead = 0;
+            }
         }
 
-        uint64_t available = (wHead >= sLocalReadHead) ? (wHead - sLocalReadHead) : 0;
+        uint64_t available = wHead - sLocalReadHead;
 
         if (available >= framesToFill) {
             /* Copy frames from the ring buffer */

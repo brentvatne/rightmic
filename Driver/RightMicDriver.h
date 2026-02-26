@@ -59,7 +59,7 @@ typedef struct {
     _Atomic uint32_t active;       /* 1 = app is actively writing audio    */
     uint32_t         sampleRate;   /* negotiated sample rate               */
     uint32_t         channels;     /* negotiated channel count             */
-    uint32_t         _pad[5];      /* pad header to 64 bytes               */
+    uint32_t         _pad[9];      /* pad header to 64 bytes               */
 } RightMicRingBufferHeader;
 
 #define kRightMic_RingBufferDataBytes \

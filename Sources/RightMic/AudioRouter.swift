@@ -1,4 +1,3 @@
-import Accelerate
 import AudioToolbox
 import Combine
 import CoreAudio
@@ -24,12 +23,16 @@ final class AudioRouter {
         return ptr
     }()
 
-    /// Peak sample magnitude written by the real-time callback, read by the silence timer.
-    fileprivate let peakLevel: UnsafeMutablePointer<Float32> = {
-        let ptr = UnsafeMutablePointer<Float32>.allocate(capacity: 1)
-        ptr.initialize(to: 0)
-        return ptr
-    }()
+    // MARK: - Sample Rate Conversion
+
+    /// AudioConverter for resampling when device rate != 48000 Hz.
+    fileprivate var audioConverter: AudioConverterRef?
+    /// Output buffer for the sample rate converter (48kHz data).
+    fileprivate var converterOutputBuffer: UnsafeMutablePointer<Float>?
+    fileprivate let converterOutputCapacity: UInt32 = 8192
+    /// Temporary state used by the converter's input callback.
+    fileprivate var converterInputPtr: UnsafePointer<Float>?
+    fileprivate var converterInputFramesLeft: UInt32 = 0
 
     // MARK: - Private
 
@@ -40,22 +43,15 @@ final class AudioRouter {
     /// The device that was system default before we switched to RightMic.
     private var savedDefaultDeviceID: AudioDeviceID?
 
-    /// Silence detection: how many consecutive timer ticks we've seen silence.
-    private var silentTicks: Int = 0
-    /// Threshold in seconds before declaring a device silent.
-    private static let silenceTimeout: Int = 3
-    /// Peak level (linear) below which we consider silence.
-    private static let silenceThreshold: Float32 = 0.001 // ~-60dB
-    /// Timer that polls peak level from the callback.
-    private var silenceTimer: Timer?
-    /// True until the first silence check completes for a new device.
-    private var warmingUp: Bool = false
+    /// Prevents spamming render error logs from the real-time thread.
+    fileprivate var renderErrorLogged: Bool = false
 
     // MARK: - Lifecycle
 
     init(monitor: DeviceMonitor) {
         self.monitor = monitor
         allocateRenderBuffer()
+        allocateConverterOutputBuffer()
 
         cancellable = monitor.$resolvedDevice
             .removeDuplicates { $0?.uid == $1?.uid }
@@ -68,10 +64,9 @@ final class AudioRouter {
     deinit {
         stopCapture()
         deallocateRenderBuffer()
+        deallocateConverterOutputBuffer()
         captureActiveFlag.deinitialize(count: 1)
         captureActiveFlag.deallocate()
-        peakLevel.deinitialize(count: 1)
-        peakLevel.deallocate()
     }
 
     // MARK: - Public
@@ -85,6 +80,7 @@ final class AudioRouter {
     // MARK: - Device Change Handling
 
     private func handleDeviceChange(_ entry: PriorityEntry?) {
+        NSLog("[RightMic] handleDeviceChange called: %@", entry?.name ?? "nil")
         guard let entry = entry else {
             stopCapture()
             return
@@ -103,8 +99,14 @@ final class AudioRouter {
     // MARK: - Capture Control
 
     private func startCapture(deviceUID: String, deviceName: String) {
+        let t0 = CFAbsoluteTimeGetCurrent()
+        NSLog("[RightMic] startCapture: begin device=%@ (%@)", deviceName, deviceUID)
+
         // Already capturing from this device
-        if currentDeviceUID == deviceUID && audioUnit != nil { return }
+        if currentDeviceUID == deviceUID && audioUnit != nil {
+            NSLog("[RightMic] startCapture: already capturing from this device, skipping")
+            return
+        }
 
         // Stop existing capture first
         stopCapture()
@@ -117,62 +119,80 @@ final class AudioRouter {
 
         // Open the shared ring buffer
         do {
+            let t1 = CFAbsoluteTimeGetCurrent()
             try ringBufferWriter.open()
+            NSLog("[RightMic] startCapture: ringBufferWriter.open took %.3fs", CFAbsoluteTimeGetCurrent() - t1)
         } catch {
             NSLog("[RightMic] Failed to open ring buffer: \(error)")
             return
         }
 
         // Configure and start the AUHAL capture unit
+        let t2 = CFAbsoluteTimeGetCurrent()
         guard configureAudioUnit(deviceID: deviceID) else {
             NSLog("[RightMic] Failed to configure audio unit for: \(deviceName)")
             ringBufferWriter.close()
             return
         }
+        NSLog("[RightMic] startCapture: configureAudioUnit took %.3fs", CFAbsoluteTimeGetCurrent() - t2)
 
         currentDeviceUID = deviceUID
+
+        // Reset diagnostic state
+        renderErrorLogged = false
 
         // Mark capture active (checked by the real-time callback)
         captureActiveFlag.pointee = 1
         OSMemoryBarrier()
 
-        // Start silence detection with clean state
-        peakLevel.pointee = 0
-        silentTicks = 0
-        warmingUp = true
-        monitor?.isWarming = true
-        startSilenceTimer()
-
         // Set system default input to RightMic virtual device
+        let t3 = CFAbsoluteTimeGetCurrent()
         claimSystemDefault()
+        NSLog("[RightMic] startCapture: claimSystemDefault took %.3fs", CFAbsoluteTimeGetCurrent() - t3)
 
-        NSLog("[RightMic] Routing started: \(deviceName) -> RightMic")
+        NSLog("[RightMic] Routing started: \(deviceName) (id=\(deviceID)) -> RightMic [total %.3fs]",
+              CFAbsoluteTimeGetCurrent() - t0)
     }
 
     private func stopCapture() {
+        let t0 = CFAbsoluteTimeGetCurrent()
+        NSLog("[RightMic] stopCapture: begin (currentDevice=%@)", currentDeviceUID ?? "nil")
+
         // Signal the real-time callback to stop before tearing down
         captureActiveFlag.pointee = 0
         OSMemoryBarrier()
 
-        stopSilenceTimer()
-        if warmingUp {
-            warmingUp = false
-            monitor?.isWarming = false
-        }
-
         if let au = audioUnit {
+            let t1 = CFAbsoluteTimeGetCurrent()
             AudioOutputUnitStop(au)
+            NSLog("[RightMic] stopCapture: AudioOutputUnitStop took %.3fs", CFAbsoluteTimeGetCurrent() - t1)
+
+            let t2 = CFAbsoluteTimeGetCurrent()
             AudioUnitUninitialize(au)
+            NSLog("[RightMic] stopCapture: AudioUnitUninitialize took %.3fs", CFAbsoluteTimeGetCurrent() - t2)
+
+            let t3 = CFAbsoluteTimeGetCurrent()
             AudioComponentInstanceDispose(au)
+            NSLog("[RightMic] stopCapture: AudioComponentInstanceDispose took %.3fs", CFAbsoluteTimeGetCurrent() - t3)
+
             audioUnit = nil
         }
 
+        destroyAudioConverter()
+
         if currentDeviceUID != nil {
+            let t4 = CFAbsoluteTimeGetCurrent()
             ringBufferWriter.close()
+            NSLog("[RightMic] stopCapture: ringBufferWriter.close took %.3fs", CFAbsoluteTimeGetCurrent() - t4)
+
+            let t5 = CFAbsoluteTimeGetCurrent()
             restoreSystemDefault()
+            NSLog("[RightMic] stopCapture: restoreSystemDefault took %.3fs", CFAbsoluteTimeGetCurrent() - t5)
+
             NSLog("[RightMic] Routing stopped")
         }
         currentDeviceUID = nil
+        NSLog("[RightMic] stopCapture: total %.3fs", CFAbsoluteTimeGetCurrent() - t0)
     }
 
     // MARK: - System Default Management
@@ -202,49 +222,6 @@ final class AudioRouter {
             NSLog("[RightMic] System default input restored")
         }
         savedDefaultDeviceID = nil
-    }
-
-    // MARK: - Silence Detection
-
-    private func startSilenceTimer() {
-        silenceTimer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
-            self?.checkSilence()
-        }
-    }
-
-    private func stopSilenceTimer() {
-        silenceTimer?.invalidate()
-        silenceTimer = nil
-    }
-
-    private func checkSilence() {
-        guard let uid = currentDeviceUID, let monitor = monitor else { return }
-
-        if warmingUp {
-            warmingUp = false
-            monitor.isWarming = false
-        }
-
-        // Read and reset the peak level from the callback
-        let peak = peakLevel.pointee
-        peakLevel.pointee = 0
-
-        // Skip silence detection for the forced device
-        if monitor.forcedDeviceUID == uid { return }
-
-        if peak < Self.silenceThreshold {
-            silentTicks += 1
-            if silentTicks == Self.silenceTimeout {
-                NSLog("[RightMic] Silence detected on \(uid) for \(Self.silenceTimeout)s, marking silent")
-                monitor.markDeviceSilent(uid)
-            }
-        } else {
-            if silentTicks >= Self.silenceTimeout {
-                NSLog("[RightMic] Audio resumed on \(uid), clearing silent flag")
-                monitor.clearDeviceSilent(uid)
-            }
-            silentTicks = 0
-        }
     }
 
     // MARK: - AUHAL Configuration
@@ -308,10 +285,30 @@ final class AudioRouter {
             return false
         }
 
+        // Query the device's native format on the input (hardware) side of bus 1
+        var deviceFormat = AudioStreamBasicDescription()
+        var formatSize = UInt32(MemoryLayout<AudioStreamBasicDescription>.size)
+        let fmtStatus = AudioUnitGetProperty(
+            au, kAudioUnitProperty_StreamFormat,
+            kAudioUnitScope_Input, 1,
+            &deviceFormat, &formatSize
+        )
+        let captureRate: Float64
+        if fmtStatus == noErr && deviceFormat.mSampleRate > 0 {
+            captureRate = deviceFormat.mSampleRate
+            NSLog("[RightMic] Device native format: %.0f Hz, %d ch, %d bits, flags=0x%X",
+                  deviceFormat.mSampleRate, deviceFormat.mChannelsPerFrame,
+                  deviceFormat.mBitsPerChannel, deviceFormat.mFormatFlags)
+        } else {
+            captureRate = 48000.0
+            NSLog("[RightMic] Could not query device format (status=%d), assuming 48kHz", fmtStatus)
+        }
+
         // Set our desired format on the output (client) side of bus 1.
-        // CoreAudio will convert from the device's native format to this.
+        // Use the device's native sample rate to avoid -10863 errors with virtual devices.
+        // If the rate differs from 48kHz, we'll convert after rendering.
         var format = AudioStreamBasicDescription(
-            mSampleRate: 48000.0,
+            mSampleRate: captureRate,
             mFormatID: kAudioFormatLinearPCM,
             mFormatFlags: kAudioFormatFlagIsFloat
                         | kAudioFormatFlagsNativeEndian
@@ -334,6 +331,25 @@ final class AudioRouter {
             return false
         }
 
+        // Create sample rate converter if device rate differs from 48kHz
+        destroyAudioConverter()
+        if captureRate != 48000.0 {
+            var srcFormat = format
+            var dstFormat = format
+            dstFormat.mSampleRate = 48000.0
+
+            var converter: AudioConverterRef?
+            let convStatus = AudioConverterNew(&srcFormat, &dstFormat, &converter)
+            guard convStatus == noErr, let converter else {
+                NSLog("[RightMic] Failed to create AudioConverter (%.0f -> 48000): %d",
+                      captureRate, convStatus)
+                AudioComponentInstanceDispose(au)
+                return false
+            }
+            audioConverter = converter
+            NSLog("[RightMic] Created sample rate converter: %.0f Hz -> 48000 Hz", captureRate)
+        }
+
         // Set input callback (fires when new audio is available)
         var callbackStruct = AURenderCallbackStruct(
             inputProc: auInputCallback,
@@ -346,6 +362,7 @@ final class AudioRouter {
         )
         guard status == noErr else {
             NSLog("[RightMic] Set input callback failed: \(status)")
+            destroyAudioConverter()
             AudioComponentInstanceDispose(au)
             return false
         }
@@ -354,6 +371,7 @@ final class AudioRouter {
         status = AudioUnitInitialize(au)
         guard status == noErr else {
             NSLog("[RightMic] AudioUnitInitialize failed: \(status)")
+            destroyAudioConverter()
             AudioComponentInstanceDispose(au)
             return false
         }
@@ -363,12 +381,22 @@ final class AudioRouter {
         guard status == noErr else {
             NSLog("[RightMic] AudioOutputUnitStart failed: \(status)")
             AudioUnitUninitialize(au)
+            destroyAudioConverter()
             AudioComponentInstanceDispose(au)
             return false
         }
 
         audioUnit = au
         return true
+    }
+
+    // MARK: - Audio Converter
+
+    private func destroyAudioConverter() {
+        if let converter = audioConverter {
+            AudioConverterDispose(converter)
+            audioConverter = nil
+        }
     }
 
     // MARK: - Render Buffer
@@ -385,6 +413,20 @@ final class AudioRouter {
         buf.deinitialize(count: count)
         buf.deallocate()
         renderBuffer = nil
+    }
+
+    private func allocateConverterOutputBuffer() {
+        let count = Int(converterOutputCapacity) * RingBufferWriter.channelCount
+        converterOutputBuffer = .allocate(capacity: count)
+        converterOutputBuffer?.initialize(repeating: 0, count: count)
+    }
+
+    private func deallocateConverterOutputBuffer() {
+        guard let buf = converterOutputBuffer else { return }
+        let count = Int(converterOutputCapacity) * RingBufferWriter.channelCount
+        buf.deinitialize(count: count)
+        buf.deallocate()
+        converterOutputBuffer = nil
     }
 }
 
@@ -410,13 +452,15 @@ private func auInputCallback(
         return noErr
     }
 
-    let bytesNeeded = inNumberFrames * UInt32(RingBufferWriter.bytesPerFrame)
+    let channels = UInt32(RingBufferWriter.channelCount)
+    let bytesPerFrame = UInt32(RingBufferWriter.bytesPerFrame)
+    let bytesNeeded = inNumberFrames * bytesPerFrame
 
     // Point an AudioBufferList at our pre-allocated buffer
     var bufferList = AudioBufferList(
         mNumberBuffers: 1,
         mBuffers: AudioBuffer(
-            mNumberChannels: UInt32(RingBufferWriter.channelCount),
+            mNumberChannels: channels,
             mDataByteSize: bytesNeeded,
             mData: UnsafeMutableRawPointer(buffer)
         )
@@ -424,17 +468,89 @@ private func auInputCallback(
 
     // Render input audio from the AUHAL into our buffer
     let status = AudioUnitRender(au, ioActionFlags, inTimeStamp, 1, inNumberFrames, &bufferList)
-    guard status == noErr else { return status }
-
-    // Track peak level for silence detection (vDSP SIMD-optimized)
-    var peak: Float32 = 0
-    vDSP_maxmgv(buffer, 1, &peak, vDSP_Length(inNumberFrames) * vDSP_Length(RingBufferWriter.channelCount))
-    if peak > router.peakLevel.pointee {
-        router.peakLevel.pointee = peak
+    guard status == noErr else {
+        // Log first render failure only (avoid spamming from real-time thread)
+        if router.renderErrorLogged == false {
+            router.renderErrorLogged = true
+            NSLog("[RightMic] AudioUnitRender failed: %d", status)
+        }
+        return status
     }
 
-    // Write the rendered frames into the ring buffer for the HAL driver
-    router.ringBufferWriter.write(frames: buffer, frameCount: Int(inNumberFrames))
+    // Write to ring buffer, converting sample rate if needed
+    if let converter = router.audioConverter,
+       let outBuffer = router.converterOutputBuffer {
+        // Set up converter input state (read by converterInputCallback)
+        router.converterInputPtr = UnsafePointer(buffer)
+        router.converterInputFramesLeft = inNumberFrames
 
+        var outputFrames = router.converterOutputCapacity
+
+        var outputBufferList = AudioBufferList(
+            mNumberBuffers: 1,
+            mBuffers: AudioBuffer(
+                mNumberChannels: channels,
+                mDataByteSize: outputFrames * bytesPerFrame,
+                mData: UnsafeMutableRawPointer(outBuffer)
+            )
+        )
+
+        let convStatus = AudioConverterFillComplexBuffer(
+            converter,
+            converterInputCallback,
+            inRefCon,
+            &outputFrames,
+            &outputBufferList,
+            nil
+        )
+
+        if convStatus == noErr || convStatus == 100 {
+            router.ringBufferWriter.write(frames: outBuffer, frameCount: Int(outputFrames))
+        }
+    } else {
+        // No conversion needed — write directly
+        router.ringBufferWriter.write(frames: buffer, frameCount: Int(inNumberFrames))
+    }
+
+    return noErr
+}
+
+// MARK: - AudioConverter Input Callback
+
+/// Called by AudioConverterFillComplexBuffer to pull input data for sample rate conversion.
+private func converterInputCallback(
+    inAudioConverter: AudioConverterRef,
+    ioNumberDataPackets: UnsafeMutablePointer<UInt32>,
+    ioData: UnsafeMutablePointer<AudioBufferList>,
+    outDataPacketDescription: UnsafeMutablePointer<UnsafeMutablePointer<AudioStreamPacketDescription>?>?,
+    inUserData: UnsafeMutableRawPointer?
+) -> OSStatus {
+    guard let inUserData else {
+        ioNumberDataPackets.pointee = 0
+        return -50 // paramErr
+    }
+
+    let router = Unmanaged<AudioRouter>.fromOpaque(inUserData).takeUnretainedValue()
+
+    let available = router.converterInputFramesLeft
+    if available == 0 {
+        ioNumberDataPackets.pointee = 0
+        return 100 // signal end of input data
+    }
+
+    let toProvide = min(ioNumberDataPackets.pointee, available)
+    let channels = UInt32(RingBufferWriter.channelCount)
+    let bytesPerFrame = UInt32(RingBufferWriter.bytesPerFrame)
+
+    ioData.pointee.mNumberBuffers = 1
+    ioData.pointee.mBuffers.mNumberChannels = channels
+    ioData.pointee.mBuffers.mDataByteSize = toProvide * bytesPerFrame
+    ioData.pointee.mBuffers.mData = UnsafeMutableRawPointer(mutating: router.converterInputPtr!)
+
+    ioNumberDataPackets.pointee = toProvide
+    router.converterInputFramesLeft -= toProvide
+    router.converterInputPtr = router.converterInputPtr?.advanced(by: Int(toProvide * channels))
+
+    outDataPacketDescription?.pointee = nil
     return noErr
 }

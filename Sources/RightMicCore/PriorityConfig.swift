@@ -16,11 +16,17 @@ public struct PriorityEntry: Codable, Identifiable, Equatable {
     /// Whether this device is included in priority routing.
     public var enabled: Bool
 
-    public init(uid: String, name: String, transportType: AudioDevice.TransportType, enabled: Bool = true) {
+    /// UID of another device this one depends on. If set, this device is only
+    /// considered available when the dependency is connected. Useful for virtual
+    /// devices (e.g. Loopback) that wrap a physical input.
+    public var dependsOn: String?
+
+    public init(uid: String, name: String, transportType: AudioDevice.TransportType, enabled: Bool = true, dependsOn: String? = nil) {
         self.uid = uid
         self.name = name
         self.transportType = transportType
         self.enabled = enabled
+        self.dependsOn = dependsOn
     }
 
     public init(from device: AudioDevice, enabled: Bool = true) {
@@ -28,6 +34,7 @@ public struct PriorityEntry: Codable, Identifiable, Equatable {
         self.name = device.name
         self.transportType = device.transportType
         self.enabled = enabled
+        self.dependsOn = nil
     }
 }
 

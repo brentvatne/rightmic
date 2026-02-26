@@ -27,13 +27,7 @@ final class DeviceMonitor: ObservableObject {
     /// The highest-priority enabled device that is currently connected.
     @Published var resolvedDevice: PriorityEntry?
 
-    /// Devices detected as outputting silence (e.g. virtual device whose source is missing).
-    @Published var silentDeviceUIDs: Set<String> = []
-
-    /// True while waiting for the first silence detection pass on a new device.
-    @Published var isWarming: Bool = true
-
-    /// A device the user has forced active, bypassing silence detection and priority order.
+    /// A device the user has forced active, bypassing priority order.
     @Published var forcedDeviceUID: String?
 
     // MARK: - Private
@@ -65,30 +59,34 @@ final class DeviceMonitor: ObservableObject {
                 config.save()
             }
 
-        // Resolve best device whenever devices, config, enabled state, silence state, or force override change
-        resolveCancellable = Publishers.CombineLatest(
-                Publishers.CombineLatest4($inputDevices, $priorityConfig, $isEnabled, $silentDeviceUIDs),
-                $forcedDeviceUID
-            )
+        // Resolve best device whenever devices, config, enabled state, or force override change
+        resolveCancellable = Publishers.CombineLatest3($inputDevices, $priorityConfig, $isEnabled)
+            .combineLatest($forcedDeviceUID)
             .map { combo, forcedUID -> PriorityEntry? in
-                let (devices, config, enabled, silentUIDs) = combo
+                let (devices, config, enabled) = combo
                 guard enabled else { return nil }
-                let availableUIDs = Set(devices.map(\.uid))
-                // If a device is forced and available, use it directly
-                if let forcedUID, availableUIDs.contains(forcedUID),
+                let connectedUIDs = Set(devices.map(\.uid))
+                // If a device is forced and connected, use it directly
+                if let forcedUID, connectedUIDs.contains(forcedUID),
                    let entry = config.entries.first(where: { $0.uid == forcedUID }) {
                     return entry
                 }
-                return config.bestDevice(availableUIDs: availableUIDs.subtracting(silentUIDs))
+                // Filter out devices whose dependency is not connected
+                let depMissingUIDs = Set(config.entries.compactMap { entry -> String? in
+                    guard let dep = entry.dependsOn, !connectedUIDs.contains(dep) else { return nil }
+                    return entry.uid
+                })
+                let availableUIDs = connectedUIDs.subtracting(depMissingUIDs)
+                return config.bestDevice(availableUIDs: availableUIDs)
             }
             .removeDuplicates { (a: PriorityEntry?, b: PriorityEntry?) in a?.uid == b?.uid }
             .sink { [weak self] best in
                 guard let self else { return }
                 if self.resolvedDevice?.uid != best?.uid {
                     if let best {
-                        NSLog("[RightMic] Resolved device: \(best.name) (\(best.transportType.rawValue))")
+                        NSLog("[RightMic] Resolved device changed: \(best.name) (\(best.transportType.rawValue)) at %.3f", CFAbsoluteTimeGetCurrent())
                     } else {
-                        NSLog("[RightMic] No priority device available")
+                        NSLog("[RightMic] No priority device available at %.3f", CFAbsoluteTimeGetCurrent())
                     }
                 }
                 self.resolvedDevice = best
@@ -126,31 +124,34 @@ final class DeviceMonitor: ObservableObject {
     // MARK: - Device Enumeration
 
     func refreshDevices() {
+        NSLog("[RightMic] refreshDevices called at %.3f", CFAbsoluteTimeGetCurrent())
         let devices = Self.enumerateInputDevices()
         let defaultUID = Self.getDefaultInputDeviceUID()
+        NSLog("[RightMic] refreshDevices: enumerated %d devices", devices.count)
         DispatchQueue.main.async { [weak self] in
             guard let self else { return }
-            let oldUIDs = Set(self.inputDevices.map(\.uid))
-            let newUIDs = Set(devices.map(\.uid))
             self.inputDevices = devices
             self.defaultInputUID = defaultUID
-            self.initializePriorityIfEmpty()
-
-            // When the device topology changes (hardware plugged/unplugged),
-            // clear silent flags so the resolve pipeline re-evaluates.
-            // If the silent device's source hardware came back, it will now
-            // produce audio. If not, silence detection will re-mark it.
-            if oldUIDs != newUIDs && !self.silentDeviceUIDs.isEmpty {
-                NSLog("[RightMic] Device topology changed, re-checking silent devices")
-                self.silentDeviceUIDs.removeAll()
-            }
+            self.autoAddNewDevices()
         }
     }
 
-    /// On first run, seed the priority list with all currently connected input devices.
-    private func initializePriorityIfEmpty() {
-        guard priorityConfig.entries.isEmpty, !inputDevices.isEmpty else { return }
-        priorityConfig.entries = inputDevices.map { PriorityEntry(from: $0) }
+    /// Auto-add any connected input devices that aren't already in the priority list,
+    /// and update names for existing entries (in case the device was renamed).
+    private func autoAddNewDevices() {
+        let knownUIDs = Set(priorityConfig.entries.map(\.uid))
+        let virtualDeviceUID = DriverStatus.virtualDeviceUID
+        for device in inputDevices {
+            if device.uid == virtualDeviceUID { continue }
+            if !knownUIDs.contains(device.uid) {
+                NSLog("[RightMic] Auto-adding new device: \(device.name) (\(device.uid))")
+                priorityConfig.entries.append(PriorityEntry(from: device))
+            } else if let idx = priorityConfig.entries.firstIndex(where: { $0.uid == device.uid }),
+                      priorityConfig.entries[idx].name != device.name {
+                NSLog("[RightMic] Updating device name: \(priorityConfig.entries[idx].name) → \(device.name)")
+                priorityConfig.entries[idx].name = device.name
+            }
+        }
     }
 
     // MARK: - Priority Config Helpers
@@ -166,20 +167,29 @@ final class DeviceMonitor: ObservableObject {
         inputDevices.contains { $0.uid == uid }
     }
 
-    /// Mark a device as silent (outputting no audio). It will be skipped during resolution.
-    func markDeviceSilent(_ uid: String) {
-        silentDeviceUIDs.insert(uid)
+    /// Whether a device is effectively available (connected AND dependency met).
+    func isDeviceEffectivelyAvailable(_ uid: String) -> Bool {
+        guard isDeviceAvailable(uid) else { return false }
+        guard let entry = priorityConfig.entries.first(where: { $0.uid == uid }),
+              let dep = entry.dependsOn else { return true }
+        return isDeviceAvailable(dep)
     }
 
-    /// Clear the silent flag for a device (audio has resumed).
-    func clearDeviceSilent(_ uid: String) {
-        silentDeviceUIDs.remove(uid)
+    /// Name of the dependency device for display, if any.
+    func dependencyName(for uid: String) -> String? {
+        guard let entry = priorityConfig.entries.first(where: { $0.uid == uid }),
+              let dep = entry.dependsOn else { return nil }
+        // Try the priority list first (has saved names for disconnected devices)
+        if let depEntry = priorityConfig.entries.first(where: { $0.uid == dep }) {
+            return depEntry.name
+        }
+        // Fall back to connected devices
+        return inputDevices.first { $0.uid == dep }?.name
     }
 
-    /// Force a specific device active, bypassing silence detection and priority order.
+    /// Force a specific device active, bypassing priority order.
     func forceDevice(_ uid: String) {
         forcedDeviceUID = uid
-        silentDeviceUIDs.remove(uid)
     }
 
     /// Clear the forced device override.

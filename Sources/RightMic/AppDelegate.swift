@@ -14,6 +14,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var eventMonitor: Any?
     private var rightClickMonitor: Any?
     private var settingsWindow: NSWindow?
+    private var manageWindow: NSWindow?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSLog("[RightMic] applicationDidFinishLaunching")
@@ -61,11 +62,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func updatePopoverSize() {
         let entryCount = monitor.priorityConfig.entries.count
-        let headerHeight: CGFloat = 41
+        let padding: CGFloat = 12
         let listHeight: CGFloat = entryCount > 0
-            ? CGFloat(entryCount) * 34
-            : 100 // empty state
-        popover.contentSize = NSSize(width: 300, height: headerHeight + listHeight)
+            ? CGFloat(entryCount) * 32
+            : 100
+        popover.contentSize = NSSize(width: 300, height: listHeight + padding)
     }
 
     // MARK: - Settings Window
@@ -121,6 +122,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
             let menu = NSMenu()
 
+            let enableItem = NSMenuItem(title: "Enabled", action: #selector(self.toggleEnabled(_:)), keyEquivalent: "")
+            enableItem.target = self
+            enableItem.state = self.monitor.isEnabled ? .on : .off
+            menu.addItem(enableItem)
+
+            menu.addItem(.separator())
+
+            let manageItem = NSMenuItem(title: "Manage Devices…", action: #selector(self.openManageDevices), keyEquivalent: "")
+            manageItem.target = self
+            menu.addItem(manageItem)
+
             let launchItem = NSMenuItem(title: "Launch at Login", action: #selector(self.toggleLaunchAtLogin(_:)), keyEquivalent: "")
             launchItem.target = self
             launchItem.state = SMAppService.mainApp.status == .enabled ? .on : .off
@@ -134,6 +146,33 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             self.statusItem.menu = nil
             return nil
         }
+    }
+
+    @objc private func toggleEnabled(_ sender: NSMenuItem) {
+        monitor.isEnabled.toggle()
+    }
+
+    @objc private func openManageDevices() {
+        if popover.isShown { popover.performClose(nil) }
+
+        if let window = manageWindow {
+            window.makeKeyAndOrderFront(nil)
+            NSApp.activate(ignoringOtherApps: true)
+            return
+        }
+
+        let view = ManageDevicesView(monitor: monitor)
+        let controller = NSHostingController(rootView: view)
+        let fittingSize = controller.sizeThatFits(in: NSSize(width: 300, height: CGFloat.greatestFiniteMagnitude))
+        let window = NSWindow(contentViewController: controller)
+        window.title = "Manage Devices"
+        window.styleMask = [.titled, .closable]
+        window.setContentSize(fittingSize)
+        window.center()
+        window.isReleasedWhenClosed = false
+        window.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
+        manageWindow = window
     }
 
     @objc private func toggleLaunchAtLogin(_ sender: NSMenuItem) {

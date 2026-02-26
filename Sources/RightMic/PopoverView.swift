@@ -8,36 +8,17 @@ struct PopoverView: View {
 
     var body: some View {
         VStack(spacing: 0) {
-            headerSection
             if !DriverStatus.isVirtualDeviceAvailable {
                 driverWarningSection
+                Divider()
             }
-            Divider()
             deviceListSection
         }
+        .padding(.vertical, 6)
         .frame(width: 300)
     }
 
     // MARK: - Sections
-
-    private var headerSection: some View {
-        HStack {
-            Text("RightMic")
-                .font(.headline)
-            if monitor.isWarming {
-                ProgressView()
-                    .controlSize(.small)
-                    .scaleEffect(0.7)
-            }
-            Spacer()
-            Toggle("", isOn: $monitor.isEnabled)
-                .toggleStyle(.switch)
-                .labelsHidden()
-                .controlSize(.small)
-        }
-        .padding(.horizontal, 16)
-        .padding(.vertical, 10)
-    }
 
     private var driverWarningSection: some View {
         HStack(spacing: 6) {
@@ -73,15 +54,15 @@ struct PopoverView: View {
                 List {
                     ForEach(Array(monitor.priorityConfig.entries.enumerated()), id: \.element.uid) { index, entry in
                         let isActive = monitor.isEnabled && entry.uid == monitor.resolvedDevice?.uid
-                        let isAvailable = monitor.isDeviceAvailable(entry.uid)
-                        let isSilent = monitor.silentDeviceUIDs.contains(entry.uid)
+                        let isAvailable = monitor.isDeviceEffectivelyAvailable(entry.uid)
+                        let depMissing = entry.dependsOn != nil && monitor.isDeviceAvailable(entry.uid) && !isAvailable
                         PriorityDeviceRow(
                             entry: entry,
                             position: index + 1,
                             isActive: isActive,
                             isAvailable: isAvailable,
-                            isSilent: isSilent,
-                            isLast: index == monitor.priorityConfig.entries.count - 1
+                            isLast: index == monitor.priorityConfig.entries.count - 1,
+                            dependencyName: depMissing ? monitor.dependencyName(for: entry.uid) : nil
                         )
                         .contextMenu {
                             Button(entry.enabled ? "Disable" : "Enable") {
@@ -94,6 +75,17 @@ struct PopoverView: View {
                             } else if isAvailable && entry.enabled {
                                 Button("Force") {
                                     monitor.forceDevice(entry.uid)
+                                }
+                            }
+                            Menu("Depends on") {
+                                Button("None") {
+                                    monitor.priorityConfig.entries[index].dependsOn = nil
+                                }
+                                Divider()
+                                ForEach(monitor.priorityConfig.entries.filter({ $0.uid != entry.uid }), id: \.uid) { other in
+                                    Button(other.name) {
+                                        monitor.priorityConfig.entries[index].dependsOn = other.uid
+                                    }
                                 }
                             }
                         }
@@ -121,8 +113,8 @@ struct PriorityDeviceRow: View {
     let position: Int
     let isActive: Bool
     let isAvailable: Bool
-    var isSilent: Bool = false
     var isLast: Bool = false
+    var dependencyName: String? = nil
 
     var body: some View {
         HStack(spacing: 8) {
@@ -153,7 +145,7 @@ struct PriorityDeviceRow: View {
     private var statusText: String? {
         if isActive { return "Active" }
         if !entry.enabled { return "Disabled" }
-        if isSilent { return "Silent" }
+        if let depName = dependencyName { return "Needs \(depName)" }
         if !isAvailable { return "Disconnected" }
         return nil
     }
@@ -170,8 +162,42 @@ struct PriorityDeviceRow: View {
         if isActive { return .green }
         if !entry.enabled { return .primary }
         if !isAvailable { return .primary }
-        if isSilent { return .orange }
         if isAvailable { return .blue.opacity(0.5) }
         return .gray.opacity(0.3)
+    }
+}
+
+/// Window for removing disconnected devices from the priority list.
+struct ManageDevicesView: View {
+    @ObservedObject var monitor: DeviceMonitor
+
+    private var unavailableEntries: [PriorityEntry] {
+        monitor.priorityConfig.entries.filter { !monitor.isDeviceAvailable($0.uid) }
+    }
+
+    var body: some View {
+        VStack(spacing: 0) {
+            if unavailableEntries.isEmpty {
+                Text("No unavailable devices to remove.")
+                    .font(.system(size: 13))
+                    .foregroundColor(.secondary)
+                    .padding(.vertical, 20)
+            } else {
+                ForEach(unavailableEntries, id: \.uid) { entry in
+                    HStack {
+                        Text(entry.name)
+                            .font(.system(size: 13))
+                        Spacer()
+                        Button("Remove") {
+                            monitor.priorityConfig.entries.removeAll { $0.uid == entry.uid }
+                        }
+                        .controlSize(.small)
+                    }
+                    .padding(.horizontal, 16)
+                    .padding(.vertical, 8)
+                }
+            }
+        }
+        .frame(width: 300)
     }
 }
