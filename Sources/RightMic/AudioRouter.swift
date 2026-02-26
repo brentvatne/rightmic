@@ -1,3 +1,4 @@
+import Accelerate
 import AudioToolbox
 import Combine
 import CoreAudio
@@ -14,11 +15,41 @@ final class AudioRouter {
     fileprivate var renderBuffer: UnsafeMutablePointer<Float>?
     fileprivate let renderBufferFrameCapacity: UInt32 = 4096
 
+    /// Atomic flag checked by the real-time callback. Set to 0 before
+    /// tearing down the audio unit so the callback can bail out safely.
+    /// Allocated on the heap so the pointer is stable across moves.
+    fileprivate let captureActiveFlag: UnsafeMutablePointer<Int32> = {
+        let ptr = UnsafeMutablePointer<Int32>.allocate(capacity: 1)
+        ptr.initialize(to: 0)
+        return ptr
+    }()
+
+    /// Peak sample magnitude written by the real-time callback, read by the silence timer.
+    fileprivate let peakLevel: UnsafeMutablePointer<Float32> = {
+        let ptr = UnsafeMutablePointer<Float32>.allocate(capacity: 1)
+        ptr.initialize(to: 0)
+        return ptr
+    }()
+
     // MARK: - Private
 
     private var cancellable: AnyCancellable?
     private var currentDeviceUID: String?
     private weak var monitor: DeviceMonitor?
+
+    /// The device that was system default before we switched to RightMic.
+    private var savedDefaultDeviceID: AudioDeviceID?
+
+    /// Silence detection: how many consecutive timer ticks we've seen silence.
+    private var silentTicks: Int = 0
+    /// Threshold in seconds before declaring a device silent.
+    private static let silenceTimeout: Int = 3
+    /// Peak level (linear) below which we consider silence.
+    private static let silenceThreshold: Float32 = 0.001 // ~-60dB
+    /// Timer that polls peak level from the callback.
+    private var silenceTimer: Timer?
+    /// True until the first silence check completes for a new device.
+    private var warmingUp: Bool = false
 
     // MARK: - Lifecycle
 
@@ -37,11 +68,15 @@ final class AudioRouter {
     deinit {
         stopCapture()
         deallocateRenderBuffer()
+        captureActiveFlag.deinitialize(count: 1)
+        captureActiveFlag.deallocate()
+        peakLevel.deinitialize(count: 1)
+        peakLevel.deallocate()
     }
 
     // MARK: - Public
 
-    /// Stop routing and clean up shared memory. Call on app termination.
+    /// Stop routing, restore system default, and clean up. Call on app termination.
     func shutdown() {
         stopCapture()
         ringBufferWriter.unlink()
@@ -96,10 +131,35 @@ final class AudioRouter {
         }
 
         currentDeviceUID = deviceUID
+
+        // Mark capture active (checked by the real-time callback)
+        captureActiveFlag.pointee = 1
+        OSMemoryBarrier()
+
+        // Start silence detection with clean state
+        peakLevel.pointee = 0
+        silentTicks = 0
+        warmingUp = true
+        monitor?.isWarming = true
+        startSilenceTimer()
+
+        // Set system default input to RightMic virtual device
+        claimSystemDefault()
+
         NSLog("[RightMic] Routing started: \(deviceName) -> RightMic")
     }
 
     private func stopCapture() {
+        // Signal the real-time callback to stop before tearing down
+        captureActiveFlag.pointee = 0
+        OSMemoryBarrier()
+
+        stopSilenceTimer()
+        if warmingUp {
+            warmingUp = false
+            monitor?.isWarming = false
+        }
+
         if let au = audioUnit {
             AudioOutputUnitStop(au)
             AudioUnitUninitialize(au)
@@ -109,9 +169,82 @@ final class AudioRouter {
 
         if currentDeviceUID != nil {
             ringBufferWriter.close()
+            restoreSystemDefault()
             NSLog("[RightMic] Routing stopped")
         }
         currentDeviceUID = nil
+    }
+
+    // MARK: - System Default Management
+
+    private func claimSystemDefault() {
+        guard let virtualID = DriverStatus.virtualDeviceAudioID else {
+            NSLog("[RightMic] Virtual device not available, cannot set system default")
+            return
+        }
+
+        // Save the current default so we can restore it later
+        if let currentDefault = DriverStatus.currentDefaultInputDeviceID,
+           currentDefault != virtualID {
+            savedDefaultDeviceID = currentDefault
+        }
+
+        if DriverStatus.setDefaultInputDevice(virtualID) {
+            NSLog("[RightMic] System default input set to RightMic")
+        } else {
+            NSLog("[RightMic] Failed to set system default input")
+        }
+    }
+
+    private func restoreSystemDefault() {
+        guard let savedID = savedDefaultDeviceID else { return }
+        if DriverStatus.setDefaultInputDevice(savedID) {
+            NSLog("[RightMic] System default input restored")
+        }
+        savedDefaultDeviceID = nil
+    }
+
+    // MARK: - Silence Detection
+
+    private func startSilenceTimer() {
+        silenceTimer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
+            self?.checkSilence()
+        }
+    }
+
+    private func stopSilenceTimer() {
+        silenceTimer?.invalidate()
+        silenceTimer = nil
+    }
+
+    private func checkSilence() {
+        guard let uid = currentDeviceUID, let monitor = monitor else { return }
+
+        if warmingUp {
+            warmingUp = false
+            monitor.isWarming = false
+        }
+
+        // Read and reset the peak level from the callback
+        let peak = peakLevel.pointee
+        peakLevel.pointee = 0
+
+        // Skip silence detection for the forced device
+        if monitor.forcedDeviceUID == uid { return }
+
+        if peak < Self.silenceThreshold {
+            silentTicks += 1
+            if silentTicks == Self.silenceTimeout {
+                NSLog("[RightMic] Silence detected on \(uid) for \(Self.silenceTimeout)s, marking silent")
+                monitor.markDeviceSilent(uid)
+            }
+        } else {
+            if silentTicks >= Self.silenceTimeout {
+                NSLog("[RightMic] Audio resumed on \(uid), clearing silent flag")
+                monitor.clearDeviceSilent(uid)
+            }
+            silentTicks = 0
+        }
     }
 
     // MARK: - AUHAL Configuration
@@ -269,7 +402,9 @@ private func auInputCallback(
 ) -> OSStatus {
     let router = Unmanaged<AudioRouter>.fromOpaque(inRefCon).takeUnretainedValue()
 
-    guard let au = router.audioUnit,
+    // Bail out if capture is being torn down on the main thread
+    guard router.captureActiveFlag.pointee != 0,
+          let au = router.audioUnit,
           let buffer = router.renderBuffer,
           inNumberFrames <= router.renderBufferFrameCapacity else {
         return noErr
@@ -290,6 +425,13 @@ private func auInputCallback(
     // Render input audio from the AUHAL into our buffer
     let status = AudioUnitRender(au, ioActionFlags, inTimeStamp, 1, inNumberFrames, &bufferList)
     guard status == noErr else { return status }
+
+    // Track peak level for silence detection (vDSP SIMD-optimized)
+    var peak: Float32 = 0
+    vDSP_maxmgv(buffer, 1, &peak, vDSP_Length(inNumberFrames) * vDSP_Length(RingBufferWriter.channelCount))
+    if peak > router.peakLevel.pointee {
+        router.peakLevel.pointee = peak
+    }
 
     // Write the rendered frames into the ring buffer for the HAL driver
     router.ringBufferWriter.write(frames: buffer, frameCount: Int(inNumberFrames))

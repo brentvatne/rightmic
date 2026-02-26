@@ -105,12 +105,28 @@ struct SettingsView: View {
     // MARK: - Options
 
     private var optionsSection: some View {
-        HStack {
-            Toggle("Launch at Login", isOn: $launchAtLogin)
-                .onChange(of: launchAtLogin) { _, newValue in
-                    setLaunchAtLogin(newValue)
+        VStack(alignment: .leading, spacing: 10) {
+            HStack {
+                Toggle("Enabled", isOn: $monitor.isEnabled)
+                Spacer()
+            }
+            HStack {
+                Toggle("Launch at Login", isOn: $launchAtLogin)
+                    .onChange(of: launchAtLogin) { _, newValue in
+                        setLaunchAtLogin(newValue)
+                    }
+                Spacer()
+            }
+            if !DriverStatus.isVirtualDeviceAvailable {
+                HStack(spacing: 6) {
+                    Image(systemName: "exclamationmark.triangle.fill")
+                        .foregroundColor(.yellow)
+                        .font(.system(size: 12))
+                    Text("RightMic audio driver is not installed. Run the install script to enable audio routing.")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
                 }
-            Spacer()
+            }
         }
         .padding()
     }

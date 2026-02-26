@@ -1,6 +1,7 @@
 import AppKit
 import Combine
 import RightMicCore
+import ServiceManagement
 import SwiftUI
 
 final class AppDelegate: NSObject, NSApplicationDelegate {
@@ -51,14 +52,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func setupPopover() {
         popover = NSPopover()
-        popover.contentSize = NSSize(width: 300, height: 400)
         popover.behavior = .transient
         popover.animates = true
 
-        let popoverView = PopoverContentView(monitor: monitor) { [weak self] in
-            self?.openSettings()
-        }
+        let popoverView = PopoverContentView(monitor: monitor)
         popover.contentViewController = NSHostingController(rootView: popoverView)
+    }
+
+    private func updatePopoverSize() {
+        let entryCount = monitor.priorityConfig.entries.count
+        let headerHeight: CGFloat = 41
+        let listHeight: CGFloat = entryCount > 0
+            ? CGFloat(entryCount) * 34
+            : 100 // empty state
+        popover.contentSize = NSSize(width: 300, height: headerHeight + listHeight)
     }
 
     // MARK: - Settings Window
@@ -95,6 +102,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if popover.isShown {
             popover.performClose(sender)
         } else {
+            updatePopoverSize()
             popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
             popover.contentViewController?.view.window?.makeKey()
         }
@@ -112,12 +120,31 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             guard button.bounds.contains(locationInButton) else { return event }
 
             let menu = NSMenu()
+
+            let launchItem = NSMenuItem(title: "Launch at Login", action: #selector(self.toggleLaunchAtLogin(_:)), keyEquivalent: "")
+            launchItem.target = self
+            launchItem.state = SMAppService.mainApp.status == .enabled ? .on : .off
+            menu.addItem(launchItem)
+
+            menu.addItem(.separator())
             menu.addItem(NSMenuItem(title: "Quit RightMic", action: #selector(self.quitApp), keyEquivalent: "q"))
             menu.items.forEach { $0.target = self }
             self.statusItem.menu = menu
             button.performClick(nil)
             self.statusItem.menu = nil
             return nil
+        }
+    }
+
+    @objc private func toggleLaunchAtLogin(_ sender: NSMenuItem) {
+        do {
+            if SMAppService.mainApp.status == .enabled {
+                try SMAppService.mainApp.unregister()
+            } else {
+                try SMAppService.mainApp.register()
+            }
+        } catch {
+            NSLog("[RightMic] Failed to update login item: \(error)")
         }
     }
 
@@ -153,11 +180,10 @@ final class PassthroughHostingView<Content: View>: NSHostingView<Content> {
 /// Wrapper that decides between showing the permission view or the main popover.
 struct PopoverContentView: View {
     @ObservedObject var monitor: DeviceMonitor
-    var onConfigure: () -> Void = {}
 
     var body: some View {
         if monitor.permissionGranted {
-            PopoverView(monitor: monitor, onConfigure: onConfigure)
+            PopoverView(monitor: monitor)
         } else {
             PermissionView {
                 monitor.requestPermission { _ in }

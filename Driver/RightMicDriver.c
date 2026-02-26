@@ -18,6 +18,7 @@
 #include <stdatomic.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <sys/stat.h>
 #include <fcntl.h>
 #include <unistd.h>
 #include <dispatch/dispatch.h>
@@ -56,6 +57,9 @@ static int                      sShm_FD   = -1;
 static void *                   sShm_Ptr  = MAP_FAILED;
 static RightMicRingBufferHeader *sRingHeader = NULL;
 static float *                  sRingData   = NULL;
+
+/* Driver-local read head (avoids needing write access to shared memory) */
+static uint64_t sLocalReadHead = 0;
 
 /* ================================================================
  * Section 2 – Forward Declarations
@@ -671,9 +675,8 @@ static OSStatus RightMic_GetPropertyData(AudioServerPlugInDriverRef inDriver, Au
         case kAudioDevicePropertyDeviceCanBeDefaultDevice:
             if (inDataSize < sizeof(UInt32)) return kAudioHardwareBadPropertySizeError;
             *outDataSize = sizeof(UInt32);
-            /* Allow as default input device */
-            *(UInt32 *)outData = (inAddress->mScope == kAudioObjectPropertyScopeInput ||
-                                  inAddress->mScope == kAudioObjectPropertyScopeGlobal) ? 1 : 0;
+            /* Allow as default input device only */
+            *(UInt32 *)outData = (inAddress->mScope == kAudioObjectPropertyScopeInput) ? 1 : 0;
             return kAudioHardwareNoError;
 
         case kAudioDevicePropertyDeviceCanBeDefaultSystemDevice:
@@ -886,6 +889,16 @@ static void RightMic_OpenSharedMemory(void)
         return;
     }
 
+    /* Verify the file is the expected size before mapping */
+    struct stat st;
+    if (fstat(sShm_FD, &st) != 0 || st.st_size < (off_t)kRightMic_SharedMemorySize) {
+        LOG_INFO("Shared memory file too small (%lld bytes, need %lu), retrying later",
+                 (long long)st.st_size, (unsigned long)kRightMic_SharedMemorySize);
+        close(sShm_FD);
+        sShm_FD = -1;
+        return;
+    }
+
     sShm_Ptr = mmap(NULL, kRightMic_SharedMemorySize, PROT_READ, MAP_SHARED, sShm_FD, 0);
     if (sShm_Ptr == MAP_FAILED) {
         LOG_ERROR("Failed to mmap shared memory file");
@@ -929,6 +942,7 @@ static OSStatus RightMic_StartIO(AudioServerPlugInDriverRef inDriver, AudioObjec
     Float64 nsPerPeriod = ((Float64)kRightMic_BufferFrameSize / kRightMic_SampleRate) * 1000000000.0;
     sIO_HostTicksPerPeriod = (uint64_t)(nsPerPeriod * (Float64)sTimebaseInfo.denom / (Float64)sTimebaseInfo.numer);
 
+    sLocalReadHead = 0;
     RightMic_OpenSharedMemory();
 
     sDeviceIsRunning = true;
@@ -1016,14 +1030,19 @@ static OSStatus RightMic_DoIOOperation(AudioServerPlugInDriverRef inDriver, Audi
     /* Read from shared memory ring buffer if available and active */
     if (sRingHeader != NULL && atomic_load_explicit(&sRingHeader->active, memory_order_acquire)) {
         uint64_t wHead = atomic_load_explicit(&sRingHeader->writeHead, memory_order_acquire);
-        uint64_t rHead = atomic_load_explicit(&sRingHeader->readHead, memory_order_relaxed);
-        uint64_t available = (wHead >= rHead) ? (wHead - rHead) : 0;
+
+        /* Sync local read head to writer on first IO or after a reset */
+        if (sLocalReadHead == 0 && wHead > 0) {
+            sLocalReadHead = (wHead > framesToFill) ? (wHead - framesToFill) : 0;
+        }
+
+        uint64_t available = (wHead >= sLocalReadHead) ? (wHead - sLocalReadHead) : 0;
 
         if (available >= framesToFill) {
             /* Copy frames from the ring buffer */
             UInt32 framesRead = 0;
             while (framesRead < framesToFill) {
-                uint64_t ringIndex = (rHead + framesRead) % kRightMic_RingBufferFrames;
+                uint64_t ringIndex = (sLocalReadHead + framesRead) % kRightMic_RingBufferFrames;
                 UInt32 contiguous = (UInt32)(kRightMic_RingBufferFrames - ringIndex);
                 UInt32 chunk = framesToFill - framesRead;
                 if (chunk > contiguous) chunk = contiguous;
@@ -1034,8 +1053,8 @@ static OSStatus RightMic_DoIOOperation(AudioServerPlugInDriverRef inDriver, Audi
                 framesRead += chunk;
             }
 
-            /* Advance the read head */
-            atomic_store_explicit(&sRingHeader->readHead, rHead + framesToFill, memory_order_release);
+            /* Advance local read head */
+            sLocalReadHead += framesToFill;
             return kAudioHardwareNoError;
         }
         /* Not enough data – fall through to silence */

@@ -7,13 +7,18 @@ struct MenuBarView: View {
 
     var body: some View {
         HStack(spacing: 3) {
-            Image(systemName: "mic.fill")
+            Image(systemName: monitor.isEnabled ? "arrow.triangle.branch" : "arrow.triangle.branch")
                 .font(.system(size: 13))
-                .foregroundStyle(.primary)
+                .foregroundStyle(monitor.isEnabled ? .primary : .secondary)
             Circle()
-                .fill(monitor.resolvedDevice != nil ? Color.green : Color.secondary)
+                .fill(statusColor)
                 .frame(width: 6, height: 6)
         }
         .frame(width: 24)
+    }
+
+    private var statusColor: Color {
+        if !monitor.isEnabled { return .secondary }
+        return monitor.resolvedDevice != nil ? .green : .orange
     }
 }

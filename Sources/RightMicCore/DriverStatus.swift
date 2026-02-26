@@ -16,17 +16,13 @@ public enum DriverStatus {
     }
 
     /// Whether the RightMic virtual device is currently visible to CoreAudio.
-    /// This checks the live device list, so it returns true only if the driver
-    /// is installed AND coreaudiod has loaded it.
     public static var isVirtualDeviceAvailable: Bool {
-        // Import CoreAudio inline to keep RightMicCore framework-light
-        // (this file only runs on macOS where CoreAudio is always available).
-        return checkDeviceExists()
+        virtualDeviceAudioID != nil
     }
 
-    private static func checkDeviceExists() -> Bool {
-        // Use the same CoreAudio enumeration pattern as DeviceMonitor.
-        // We look for a device with our known UID.
+    /// The CoreAudio AudioDeviceID of the RightMic virtual device, or nil
+    /// if the driver isn't installed or loaded.
+    public static var virtualDeviceAudioID: AudioDeviceID? {
         var address = AudioObjectPropertyAddress(
             mSelector: kAudioHardwarePropertyDevices,
             mScope: kAudioObjectPropertyScopeGlobal,
@@ -36,21 +32,55 @@ public enum DriverStatus {
         guard AudioObjectGetPropertyDataSize(
             AudioObjectID(kAudioObjectSystemObject),
             &address, 0, nil, &dataSize
-        ) == noErr else { return false }
+        ) == noErr else { return nil }
 
         let count = Int(dataSize) / MemoryLayout<AudioDeviceID>.size
         var deviceIDs = [AudioDeviceID](repeating: 0, count: count)
         guard AudioObjectGetPropertyData(
             AudioObjectID(kAudioObjectSystemObject),
             &address, 0, nil, &dataSize, &deviceIDs
-        ) == noErr else { return false }
+        ) == noErr else { return nil }
 
         for deviceID in deviceIDs {
             if getUID(deviceID) == virtualDeviceUID {
-                return true
+                return deviceID
             }
         }
-        return false
+        return nil
+    }
+
+    /// Set the system default input device.
+    @discardableResult
+    public static func setDefaultInputDevice(_ deviceID: AudioDeviceID) -> Bool {
+        var address = AudioObjectPropertyAddress(
+            mSelector: kAudioHardwarePropertyDefaultInputDevice,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        var id = deviceID
+        let status = AudioObjectSetPropertyData(
+            AudioObjectID(kAudioObjectSystemObject),
+            &address, 0, nil,
+            UInt32(MemoryLayout<AudioDeviceID>.size),
+            &id
+        )
+        return status == noErr
+    }
+
+    /// Get the current system default input device ID.
+    public static var currentDefaultInputDeviceID: AudioDeviceID? {
+        var address = AudioObjectPropertyAddress(
+            mSelector: kAudioHardwarePropertyDefaultInputDevice,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        var deviceID = AudioDeviceID(0)
+        var size = UInt32(MemoryLayout<AudioDeviceID>.size)
+        guard AudioObjectGetPropertyData(
+            AudioObjectID(kAudioObjectSystemObject),
+            &address, 0, nil, &size, &deviceID
+        ) == noErr, deviceID != 0 else { return nil }
+        return deviceID
     }
 
     private static func getUID(_ deviceID: AudioDeviceID) -> String? {
