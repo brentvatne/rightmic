@@ -129,17 +129,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
             menu.addItem(.separator())
 
-            let manageItem = NSMenuItem(title: "Manage Devices…", action: #selector(self.openManageDevices), keyEquivalent: "")
+            let manageItem = NSMenuItem(title: "Manage devices…", action: #selector(self.openManageDevices), keyEquivalent: "")
             manageItem.target = self
             menu.addItem(manageItem)
 
-            let launchItem = NSMenuItem(title: "Launch at Login", action: #selector(self.toggleLaunchAtLogin(_:)), keyEquivalent: "")
+            let launchItem = NSMenuItem(title: "Launch at login", action: #selector(self.toggleLaunchAtLogin(_:)), keyEquivalent: "")
             launchItem.target = self
             launchItem.state = SMAppService.mainApp.status == .enabled ? .on : .off
             menu.addItem(launchItem)
 
             menu.addItem(.separator())
-            menu.addItem(NSMenuItem(title: "Quit RightMic", action: #selector(self.quitApp), keyEquivalent: "q"))
+
+            let version = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "?"
+            let versionItem = NSMenuItem(title: "v\(version)", action: nil, keyEquivalent: "")
+            versionItem.isEnabled = false
+            menu.addItem(versionItem)
+
+            menu.addItem(NSMenuItem(title: "Quit", action: #selector(self.quitApp), keyEquivalent: "q"))
             menu.items.forEach { $0.target = self }
             self.statusItem.menu = menu
             button.performClick(nil)

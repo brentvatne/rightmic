@@ -78,25 +78,13 @@ struct PopoverView: View {
                                 }
                             }
                             Menu("Depends on") {
-                                Button {
+                                Button(entry.dependsOn == nil ? "✓ None" : "  None") {
                                     monitor.priorityConfig.entries[index].dependsOn = nil
-                                } label: {
-                                    if entry.dependsOn == nil {
-                                        Label("None", systemImage: "checkmark")
-                                    } else {
-                                        Text("None")
-                                    }
                                 }
                                 Divider()
                                 ForEach(monitor.priorityConfig.entries.filter({ $0.uid != entry.uid }), id: \.uid) { other in
-                                    Button {
+                                    Button(entry.dependsOn == other.uid ? "✓ \(other.name)" : "  \(other.name)") {
                                         monitor.priorityConfig.entries[index].dependsOn = other.uid
-                                    } label: {
-                                        if entry.dependsOn == other.uid {
-                                            Label(other.name, systemImage: "checkmark")
-                                        } else {
-                                            Text(other.name)
-                                        }
                                     }
                                 }
                             }
