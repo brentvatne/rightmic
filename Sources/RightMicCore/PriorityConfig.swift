@@ -16,9 +16,10 @@ public struct PriorityEntry: Codable, Identifiable, Equatable {
     /// Whether this device is included in priority routing.
     public var enabled: Bool
 
-    /// UID of another device this one depends on. If set, this device is only
-    /// considered available when the dependency is connected. Useful for virtual
-    /// devices (e.g. Loopback) that wrap a physical input.
+    /// Name of another device this one depends on. If set, this device is only
+    /// considered available when a device with that name is connected. Useful for
+    /// virtual devices (e.g. Loopback) that wrap a physical input.
+    /// Stored as a name rather than UID so it survives USB reconnections.
     public var dependsOn: String?
 
     public init(uid: String, name: String, transportType: AudioDevice.TransportType, enabled: Bool = true, dependsOn: String? = nil) {
@@ -111,7 +112,6 @@ public struct PriorityConfig: Codable, Equatable {
                 $0.name == device.name && $0.transportType == device.transportType && !connectedUIDs.contains($0.uid)
             }) {
                 // Device reconnected with a new UID — update the existing entry in place
-                let oldUID = entries[idx].uid
                 entries[idx] = PriorityEntry(
                     uid: device.uid,
                     name: device.name,
@@ -119,10 +119,6 @@ public struct PriorityConfig: Codable, Equatable {
                     enabled: entries[idx].enabled,
                     dependsOn: entries[idx].dependsOn
                 )
-                // Update any dependsOn references that pointed to the old UID
-                for i in entries.indices where entries[i].dependsOn == oldUID {
-                    entries[i].dependsOn = device.uid
-                }
             } else {
                 entries.append(PriorityEntry(from: device))
             }

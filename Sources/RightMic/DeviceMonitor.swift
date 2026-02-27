@@ -72,8 +72,9 @@ final class DeviceMonitor: ObservableObject {
                     return entry
                 }
                 // Filter out devices whose dependency is not connected
+                let connectedNames = Set(devices.map(\.name))
                 let depMissingUIDs = Set(config.entries.compactMap { entry -> String? in
-                    guard let dep = entry.dependsOn, !connectedUIDs.contains(dep) else { return nil }
+                    guard let dep = entry.dependsOn, !connectedNames.contains(dep) else { return nil }
                     return entry.uid
                 })
                 let availableUIDs = connectedUIDs.subtracting(depMissingUIDs)
@@ -163,19 +164,13 @@ final class DeviceMonitor: ObservableObject {
         guard isDeviceAvailable(uid) else { return false }
         guard let entry = priorityConfig.entries.first(where: { $0.uid == uid }),
               let dep = entry.dependsOn else { return true }
-        return isDeviceAvailable(dep)
+        return inputDevices.contains { $0.name == dep }
     }
 
     /// Name of the dependency device for display, if any.
     func dependencyName(for uid: String) -> String? {
-        guard let entry = priorityConfig.entries.first(where: { $0.uid == uid }),
-              let dep = entry.dependsOn else { return nil }
-        // Try the priority list first (has saved names for disconnected devices)
-        if let depEntry = priorityConfig.entries.first(where: { $0.uid == dep }) {
-            return depEntry.name
-        }
-        // Fall back to connected devices
-        return inputDevices.first { $0.uid == dep }?.name
+        guard let entry = priorityConfig.entries.first(where: { $0.uid == uid }) else { return nil }
+        return entry.dependsOn
     }
 
     /// Force a specific device active, bypassing priority order.

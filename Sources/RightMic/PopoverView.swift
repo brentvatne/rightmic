@@ -83,8 +83,8 @@ struct PopoverView: View {
                                 }
                                 Divider()
                                 ForEach(monitor.priorityConfig.entries.filter({ $0.uid != entry.uid }), id: \.uid) { other in
-                                    Button(entry.dependsOn == other.uid ? "✓ \(other.name)" : "  \(other.name)") {
-                                        monitor.priorityConfig.entries[index].dependsOn = other.uid
+                                    Button(entry.dependsOn == other.name ? "✓ \(other.name)" : "  \(other.name)") {
+                                        monitor.priorityConfig.entries[index].dependsOn = other.name
                                     }
                                 }
                             }
