@@ -319,7 +319,7 @@ final class RingBufferWriterTests: XCTestCase {
         XCTAssertEqual(RingBufferWriter.ringBufferFrames, 16384)
         XCTAssertEqual(RingBufferWriter.headerSize, 64)
         XCTAssertEqual(RingBufferWriter.dataSize, 16384 * 8)
-        XCTAssertEqual(RingBufferWriter.totalSize, 64 + 16384 * 8)
+        XCTAssertEqual(RingBufferWriter.totalSize, 64 + 16384 * 8 + 128) // +128 for V2 control table
     }
 
     func testOpenAndClose() throws {

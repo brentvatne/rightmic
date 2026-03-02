@@ -62,11 +62,35 @@ static float *                  sRingData   = NULL;
 /* Driver-local read head (avoids needing write access to shared memory) */
 static uint64_t sLocalReadHead = 0;
 
+/* Size of the currently-mapped shared memory region */
+static size_t sShm_MapSize = 0;
+
+/* Dynamic control table (V2 shared memory, may be NULL for old-format files) */
+static RightMicControlTable *sControlTable    = NULL;
+static uint32_t              sLastCtrlVersion = 0;
+
+/* Local cache of control entries (updated from main queue on version change).
+ * Read by property functions without locks; updated atomically via sLocalCtrlCount. */
+static uint32_t              sLocalCtrlCount  = 0;
+static RightMicControlEntry  sLocalControls[kRightMic_MaxControls];
+
+/* Value set by macOS via SetPropertyData on the STATIC mute control (objectID 4).
+ * This is separate from the dynamic table so the mute works even when the
+ * real device has no controls to proxy (e.g. AirPods Pro stem button). */
+static _Atomic UInt32 sStaticMuteValue = 0;
+
+/* Per-slot values set by macOS via SetPropertyData for DYNAMIC controls (objectIDs 5+).
+ * ORed with the app-reported values to determine effective control state. */
+static _Atomic UInt32 sDriverValues[kRightMic_MaxControls];
+
 /* ================================================================
  * Section 2 – Forward Declarations
  * ================================================================ */
 
 #pragma mark - Forward Declarations
+
+/* Control table */
+static void RightMic_UpdateControlCache(void);
 
 /* IUnknown */
 static HRESULT  RightMic_QueryInterface(void *, REFIID, LPVOID *);
@@ -224,12 +248,32 @@ static OSStatus RightMic_DestroyDevice(AudioServerPlugInDriverRef inDriver, Audi
 
 #pragma mark - Clients
 
+/* Helper: notify macOS that the control list (and thus owned objects) changed.
+ * Called when the first client opens or the last client closes the device.
+ * This makes the static mute control appear/disappear dynamically so the
+ * AirPods Pro stem button only acts as mic-mute when an app (Zoom, FaceTime, …)
+ * is actively using RightMic — otherwise the stem retains its normal
+ * play/pause behaviour for media apps on the Mac. */
+static void RightMic_NotifyControlListChanged(void)
+{
+    if (sHost == NULL) return;
+    AudioObjectPropertyAddress addrs[2] = {
+        { kAudioObjectPropertyControlList,  kAudioObjectPropertyScopeGlobal,
+          kAudioObjectPropertyElementMain },
+        { kAudioObjectPropertyOwnedObjects, kAudioObjectPropertyScopeGlobal,
+          kAudioObjectPropertyElementMain },
+    };
+    sHost->PropertiesChanged(sHost, kRightMicObjectID_Device, 2, addrs);
+}
+
 static OSStatus RightMic_AddDeviceClient(AudioServerPlugInDriverRef inDriver, AudioObjectID inDeviceObjectID,
                                           const AudioServerPlugInClientInfo *inClientInfo)
 {
     (void)inDriver; (void)inDeviceObjectID; (void)inClientInfo;
     UInt32 count = atomic_fetch_add(&sClientCount, 1) + 1;
     LOG_INFO("Client added (total: %u)", count);
+    /* First client: mute control becomes visible so macOS can route stem-button presses */
+    if (count == 1) RightMic_NotifyControlListChanged();
     return kAudioHardwareNoError;
 }
 
@@ -240,6 +284,8 @@ static OSStatus RightMic_RemoveDeviceClient(AudioServerPlugInDriverRef inDriver,
     UInt32 old = atomic_load(&sClientCount);
     UInt32 count = (old > 0) ? (atomic_fetch_sub(&sClientCount, 1) - 1) : 0;
     LOG_INFO("Client removed (total: %u)", count);
+    /* Last client gone: hide mute control so stem reverts to play/pause for media */
+    if (count == 0) RightMic_NotifyControlListChanged();
     return kAudioHardwareNoError;
 }
 
@@ -344,6 +390,7 @@ static Boolean RightMic_HasProperty(AudioServerPlugInDriverRef inDriver, AudioOb
         case kAudioDevicePropertyClockIsStable:
         case kAudioDevicePropertyIsHidden:
         case kAudioDevicePropertyPreferredChannelsForStereo:
+        case kAudioDevicePropertyMute:
             return true;
         }
         break;
@@ -366,6 +413,50 @@ static Boolean RightMic_HasProperty(AudioServerPlugInDriverRef inDriver, AudioOb
             return true;
         }
         break;
+
+    /* ── Static Mute Control (objectID 4) ───────────────────────── */
+    /* Only visible when at least one client (Zoom, FaceTime, …) has the device open.
+     * When no client is present the stem button reverts to play/pause on the Mac. */
+    case kRightMicObjectID_MuteControl:
+        if (atomic_load(&sClientCount) == 0) break;
+        switch (inAddress->mSelector) {
+        case kAudioObjectPropertyBaseClass:
+        case kAudioObjectPropertyClass:
+        case kAudioObjectPropertyOwner:
+        case kAudioObjectPropertyOwnedObjects:
+        case kAudioObjectPropertyName:
+        case kAudioBooleanControlPropertyValue:
+            return true;
+        }
+        break;
+
+    /* ── Dynamic Control Objects (objectIDs 5+) ─────────────────── */
+    default: {
+        UInt32 localCount = sLocalCtrlCount;
+        if (inObjectID >= kRightMicObjectID_FirstDynControl &&
+            inObjectID < kRightMicObjectID_FirstDynControl + localCount) {
+            UInt32 idx = inObjectID - kRightMicObjectID_FirstDynControl;
+            UInt32 cls = sLocalControls[idx].classID;
+            switch (inAddress->mSelector) {
+            case kAudioObjectPropertyBaseClass:
+            case kAudioObjectPropertyClass:
+            case kAudioObjectPropertyOwner:
+            case kAudioObjectPropertyOwnedObjects:
+            case kAudioObjectPropertyName:
+                return true;
+            case kAudioBooleanControlPropertyValue:
+                return (cls == kAudioMuteControlClassID ||
+                        cls == kAudioBooleanControlClassID);
+            case kAudioLevelControlPropertyScalarValue:
+            case kAudioLevelControlPropertyDecibelValue:
+            case kAudioLevelControlPropertyDecibelRange:
+                return (cls == kAudioLevelControlClassID);
+            default:
+                break;
+            }
+        }
+        break;
+    }
     }
 
     return false;
@@ -388,12 +479,13 @@ static OSStatus RightMic_IsPropertySettable(AudioServerPlugInDriverRef inDriver,
         return kAudioHardwareUnknownPropertyError;
     }
 
-    /* Nearly all properties are read-only.  The only settable one we
-       advertise is the nominal sample rate (though we only support one). */
+    /* Nearly all properties are read-only.  Settable ones: sample rate,
+       buffer size, stream format, device mute, and control values. */
     switch (inObjectID) {
     case kRightMicObjectID_Device:
         if (inAddress->mSelector == kAudioDevicePropertyNominalSampleRate ||
-            inAddress->mSelector == kAudioDevicePropertyBufferFrameSize) {
+            inAddress->mSelector == kAudioDevicePropertyBufferFrameSize  ||
+            inAddress->mSelector == kAudioDevicePropertyMute) {
             *outIsSettable = true;
             return kAudioHardwareNoError;
         }
@@ -405,8 +497,28 @@ static OSStatus RightMic_IsPropertySettable(AudioServerPlugInDriverRef inDriver,
             return kAudioHardwareNoError;
         }
         break;
-    default:
+    case kRightMicObjectID_MuteControl:
+        if (inAddress->mSelector == kAudioBooleanControlPropertyValue) {
+            *outIsSettable = true;
+            return kAudioHardwareNoError;
+        }
         break;
+    default: {
+        UInt32 localCount = sLocalCtrlCount;
+        if (inObjectID >= kRightMicObjectID_FirstDynControl &&
+            inObjectID < kRightMicObjectID_FirstDynControl + localCount) {
+            UInt32 idx = inObjectID - kRightMicObjectID_FirstDynControl;
+            UInt32 cls = sLocalControls[idx].classID;
+            if ((inAddress->mSelector == kAudioBooleanControlPropertyValue &&
+                 (cls == kAudioMuteControlClassID || cls == kAudioBooleanControlClassID)) ||
+                (inAddress->mSelector == kAudioLevelControlPropertyScalarValue &&
+                 cls == kAudioLevelControlClassID)) {
+                *outIsSettable = true;
+                return kAudioHardwareNoError;
+            }
+        }
+        break;
+    }
     }
 
     *outIsSettable = false;
@@ -480,7 +592,9 @@ static OSStatus RightMic_GetPropertyDataSize(AudioServerPlugInDriverRef inDriver
         case kAudioObjectPropertyOwnedObjects:
             if (inAddress->mScope == kAudioObjectPropertyScopeInput ||
                 inAddress->mScope == kAudioObjectPropertyScopeGlobal) {
-                *outDataSize = sizeof(AudioObjectID); /* 1 input stream */
+                /* stream + static mute (4, if client present) + dynamic controls (5+) */
+                UInt32 muteVisible = (atomic_load(&sClientCount) > 0) ? 1 : 0;
+                *outDataSize = (1 + muteVisible + sLocalCtrlCount) * sizeof(AudioObjectID);
             } else {
                 *outDataSize = 0;
             }
@@ -501,8 +615,14 @@ static OSStatus RightMic_GetPropertyDataSize(AudioServerPlugInDriverRef inDriver
                 *outDataSize = 0; /* no output streams */
             }
             return kAudioHardwareNoError;
-        case kAudioObjectPropertyControlList:
-            *outDataSize = 0; /* no controls */
+        case kAudioObjectPropertyControlList: {
+            /* Static mute (4, only when a client is present) + dynamic controls (5+) */
+            UInt32 muteVisible = (atomic_load(&sClientCount) > 0) ? 1 : 0;
+            *outDataSize = (muteVisible + sLocalCtrlCount) * sizeof(AudioObjectID);
+            return kAudioHardwareNoError;
+        }
+        case kAudioDevicePropertyMute:
+            *outDataSize = sizeof(UInt32);
             return kAudioHardwareNoError;
         case kAudioDevicePropertyNominalSampleRate:
             *outDataSize = sizeof(Float64);
@@ -542,6 +662,75 @@ static OSStatus RightMic_GetPropertyDataSize(AudioServerPlugInDriverRef inDriver
             return kAudioHardwareNoError;
         }
         break;
+
+    /* ── Static Mute Control (objectID 4) ───────────────────────── */
+    case kRightMicObjectID_MuteControl:
+        switch (inAddress->mSelector) {
+        case kAudioObjectPropertyBaseClass:
+        case kAudioObjectPropertyClass:
+            *outDataSize = sizeof(AudioClassID);
+            return kAudioHardwareNoError;
+        case kAudioObjectPropertyOwner:
+            *outDataSize = sizeof(AudioObjectID);
+            return kAudioHardwareNoError;
+        case kAudioObjectPropertyOwnedObjects:
+            *outDataSize = 0;
+            return kAudioHardwareNoError;
+        case kAudioObjectPropertyName:
+            *outDataSize = sizeof(CFStringRef);
+            return kAudioHardwareNoError;
+        case kAudioBooleanControlPropertyValue:
+            *outDataSize = sizeof(UInt32);
+            return kAudioHardwareNoError;
+        }
+        break;
+
+    /* ── Dynamic Control Objects (objectIDs 5+) ─────────────────── */
+    default: {
+        UInt32 localCount = sLocalCtrlCount;
+        if (inObjectID >= kRightMicObjectID_FirstDynControl &&
+            inObjectID < kRightMicObjectID_FirstDynControl + localCount) {
+            UInt32 idx = inObjectID - kRightMicObjectID_FirstDynControl;
+            UInt32 cls = sLocalControls[idx].classID;
+            switch (inAddress->mSelector) {
+            case kAudioObjectPropertyBaseClass:
+            case kAudioObjectPropertyClass:
+                *outDataSize = sizeof(AudioClassID);
+                return kAudioHardwareNoError;
+            case kAudioObjectPropertyOwner:
+                *outDataSize = sizeof(AudioObjectID);
+                return kAudioHardwareNoError;
+            case kAudioObjectPropertyOwnedObjects:
+                *outDataSize = 0;
+                return kAudioHardwareNoError;
+            case kAudioObjectPropertyName:
+                *outDataSize = sizeof(CFStringRef);
+                return kAudioHardwareNoError;
+            case kAudioBooleanControlPropertyValue:
+                if (cls == kAudioMuteControlClassID || cls == kAudioBooleanControlClassID) {
+                    *outDataSize = sizeof(UInt32);
+                    return kAudioHardwareNoError;
+                }
+                break;
+            case kAudioLevelControlPropertyScalarValue:
+            case kAudioLevelControlPropertyDecibelValue:
+                if (cls == kAudioLevelControlClassID) {
+                    *outDataSize = sizeof(Float32);
+                    return kAudioHardwareNoError;
+                }
+                break;
+            case kAudioLevelControlPropertyDecibelRange:
+                if (cls == kAudioLevelControlClassID) {
+                    *outDataSize = sizeof(AudioValueRange);
+                    return kAudioHardwareNoError;
+                }
+                break;
+            default:
+                break;
+            }
+        }
+        break;
+    }
     }
 
     return kAudioHardwareUnknownPropertyError;
@@ -729,9 +918,35 @@ static OSStatus RightMic_GetPropertyData(AudioServerPlugInDriverRef inDriver, Au
             }
             return kAudioHardwareNoError;
 
-        case kAudioObjectPropertyControlList:
-            *outDataSize = 0;
+        case kAudioObjectPropertyControlList: {
+            /* Static mute (4, only when a client is present) + dynamic controls (5+) */
+            UInt32 muteVisible = (atomic_load(&sClientCount) > 0) ? 1 : 0;
+            UInt32 localCount = sLocalCtrlCount;
+            UInt32 total = muteVisible + localCount;
+            UInt32 needed = total * sizeof(AudioObjectID);
+            UInt32 toReturn = (inDataSize < needed) ? inDataSize : needed;
+            *outDataSize = toReturn;
+            AudioObjectID *ids = (AudioObjectID *)outData;
+            UInt32 n = toReturn / sizeof(AudioObjectID);
+            UInt32 idx = 0;
+            if (muteVisible && idx < n) ids[idx++] = kRightMicObjectID_MuteControl;
+            for (UInt32 i = 0; idx < n; i++, idx++) {
+                ids[idx] = kRightMicObjectID_FirstDynControl + i;
+            }
             return kAudioHardwareNoError;
+        }
+
+        case kAudioDevicePropertyMute: {
+            if (inDataSize < sizeof(UInt32)) return kAudioHardwareBadPropertySizeError;
+            *outDataSize = sizeof(UInt32);
+            /* Effective mute = static mute OR app-side header mute */
+            UInt32 staticMuted = atomic_load_explicit(&sStaticMuteValue, memory_order_relaxed);
+            UInt32 appMuted    = sRingHeader
+                                 ? atomic_load_explicit(&sRingHeader->muted, memory_order_relaxed)
+                                 : 0;
+            *(UInt32 *)outData = (staticMuted || appMuted) ? 1 : 0;
+            return kAudioHardwareNoError;
+        }
 
         case kAudioDevicePropertyNominalSampleRate:
             if (inDataSize < sizeof(Float64)) return kAudioHardwareBadPropertySizeError;
@@ -781,16 +996,28 @@ static OSStatus RightMic_GetPropertyData(AudioServerPlugInDriverRef inDriver, Au
             return kAudioHardwareNoError;
         }
 
-        case kAudioObjectPropertyOwnedObjects:
+        case kAudioObjectPropertyOwnedObjects: {
             if (inAddress->mScope == kAudioObjectPropertyScopeInput ||
                 inAddress->mScope == kAudioObjectPropertyScopeGlobal) {
-                if (inDataSize < sizeof(AudioObjectID)) return kAudioHardwareBadPropertySizeError;
-                *outDataSize = sizeof(AudioObjectID);
-                *(AudioObjectID *)outData = kRightMicObjectID_InputStream;
+                /* Stream + static mute (4, only when client present) + dynamic controls (5+) */
+                UInt32 muteVisible = (atomic_load(&sClientCount) > 0) ? 1 : 0;
+                UInt32 localCount = sLocalCtrlCount;
+                UInt32 total = 1 + muteVisible + localCount;
+                UInt32 toReturn = (inDataSize / sizeof(AudioObjectID));
+                if (toReturn > total) toReturn = total;
+                *outDataSize = toReturn * sizeof(AudioObjectID);
+                AudioObjectID *ids = (AudioObjectID *)outData;
+                UInt32 idx = 0;
+                if (idx < toReturn) ids[idx++] = kRightMicObjectID_InputStream;
+                if (muteVisible && idx < toReturn) ids[idx++] = kRightMicObjectID_MuteControl;
+                for (UInt32 i = 0; idx < toReturn; i++, idx++) {
+                    ids[idx] = kRightMicObjectID_FirstDynControl + i;
+                }
             } else {
                 *outDataSize = 0;
             }
             return kAudioHardwareNoError;
+        }
 
         case kAudioDevicePropertyPreferredChannelsForStereo:
             if (inDataSize < 2 * sizeof(UInt32)) return kAudioHardwareBadPropertySizeError;
@@ -871,6 +1098,158 @@ static OSStatus RightMic_GetPropertyData(AudioServerPlugInDriverRef inDriver, Au
         }
         }
         break;
+
+    /* ── Static Mute Control (objectID 4) ───────────────────────── */
+    /* Only responds when at least one client has the device open. */
+    case kRightMicObjectID_MuteControl:
+        if (atomic_load(&sClientCount) == 0) break;
+        switch (inAddress->mSelector) {
+        case kAudioObjectPropertyBaseClass:
+            if (inDataSize < sizeof(AudioClassID)) return kAudioHardwareBadPropertySizeError;
+            *outDataSize = sizeof(AudioClassID);
+            *(AudioClassID *)outData = kAudioBooleanControlClassID;
+            return kAudioHardwareNoError;
+
+        case kAudioObjectPropertyClass:
+            if (inDataSize < sizeof(AudioClassID)) return kAudioHardwareBadPropertySizeError;
+            *outDataSize = sizeof(AudioClassID);
+            *(AudioClassID *)outData = kAudioMuteControlClassID;
+            return kAudioHardwareNoError;
+
+        case kAudioObjectPropertyOwner:
+            if (inDataSize < sizeof(AudioObjectID)) return kAudioHardwareBadPropertySizeError;
+            *outDataSize = sizeof(AudioObjectID);
+            *(AudioObjectID *)outData = kRightMicObjectID_Device;
+            return kAudioHardwareNoError;
+
+        case kAudioObjectPropertyOwnedObjects:
+            *outDataSize = 0;
+            return kAudioHardwareNoError;
+
+        case kAudioObjectPropertyName: {
+            if (inDataSize < sizeof(CFStringRef)) return kAudioHardwareBadPropertySizeError;
+            *outDataSize = sizeof(CFStringRef);
+            CFRetain(CFSTR("Mute"));
+            *(CFStringRef *)outData = CFSTR("Mute");
+            return kAudioHardwareNoError;
+        }
+
+        case kAudioBooleanControlPropertyValue:
+            if (inDataSize < sizeof(UInt32)) return kAudioHardwareBadPropertySizeError;
+            *outDataSize = sizeof(UInt32);
+            {
+                UInt32 staticMuted = atomic_load_explicit(&sStaticMuteValue, memory_order_relaxed);
+                UInt32 appMuted    = sRingHeader
+                                     ? atomic_load_explicit(&sRingHeader->muted, memory_order_relaxed)
+                                     : 0;
+                *(UInt32 *)outData = (staticMuted || appMuted) ? 1 : 0;
+            }
+            return kAudioHardwareNoError;
+        }
+        break;
+
+    /* ── Dynamic Control Objects (objectIDs 5+) ─────────────────── */
+    default: {
+        UInt32 localCount = sLocalCtrlCount;
+        if (inObjectID >= kRightMicObjectID_FirstDynControl &&
+            inObjectID < kRightMicObjectID_FirstDynControl + localCount) {
+            UInt32 idx = inObjectID - kRightMicObjectID_FirstDynControl;
+            UInt32 cls = sLocalControls[idx].classID;
+
+            switch (inAddress->mSelector) {
+            case kAudioObjectPropertyBaseClass:
+                if (inDataSize < sizeof(AudioClassID)) return kAudioHardwareBadPropertySizeError;
+                *outDataSize = sizeof(AudioClassID);
+                *(AudioClassID *)outData = (cls == kAudioMuteControlClassID)
+                    ? kAudioBooleanControlClassID
+                    : kAudioObjectClassID;
+                return kAudioHardwareNoError;
+
+            case kAudioObjectPropertyClass:
+                if (inDataSize < sizeof(AudioClassID)) return kAudioHardwareBadPropertySizeError;
+                *outDataSize = sizeof(AudioClassID);
+                *(AudioClassID *)outData = cls;
+                return kAudioHardwareNoError;
+
+            case kAudioObjectPropertyOwner:
+                if (inDataSize < sizeof(AudioObjectID)) return kAudioHardwareBadPropertySizeError;
+                *outDataSize = sizeof(AudioObjectID);
+                *(AudioObjectID *)outData = kRightMicObjectID_Device;
+                return kAudioHardwareNoError;
+
+            case kAudioObjectPropertyOwnedObjects:
+                *outDataSize = 0;
+                return kAudioHardwareNoError;
+
+            case kAudioObjectPropertyName: {
+                if (inDataSize < sizeof(CFStringRef)) return kAudioHardwareBadPropertySizeError;
+                *outDataSize = sizeof(CFStringRef);
+                CFStringRef name = (cls == kAudioMuteControlClassID) ? CFSTR("Mute") : CFSTR("Level");
+                CFRetain(name);
+                *(CFStringRef *)outData = name;
+                return kAudioHardwareNoError;
+            }
+
+            case kAudioBooleanControlPropertyValue:
+                if (inDataSize < sizeof(UInt32)) return kAudioHardwareBadPropertySizeError;
+                if (cls == kAudioMuteControlClassID || cls == kAudioBooleanControlClassID) {
+                    *outDataSize = sizeof(UInt32);
+                    UInt32 dv = atomic_load_explicit(&sDriverValues[idx], memory_order_relaxed);
+                    UInt32 av = sControlTable
+                                ? atomic_load_explicit(&sControlTable->entries[idx].uintValue,
+                                                       memory_order_relaxed)
+                                : 0;
+                    *(UInt32 *)outData = (dv || av) ? 1 : 0;
+                    return kAudioHardwareNoError;
+                }
+                break;
+
+            case kAudioLevelControlPropertyScalarValue:
+                if (cls == kAudioLevelControlClassID) {
+                    if (inDataSize < sizeof(Float32)) return kAudioHardwareBadPropertySizeError;
+                    *outDataSize = sizeof(Float32);
+                    Float32 av = sControlTable
+                                 ? atomic_load_explicit(&sControlTable->entries[idx].floatValue,
+                                                        memory_order_relaxed)
+                                 : 1.0f;
+                    *(Float32 *)outData = av;
+                    return kAudioHardwareNoError;
+                }
+                break;
+
+            case kAudioLevelControlPropertyDecibelValue:
+                if (cls == kAudioLevelControlClassID) {
+                    if (inDataSize < sizeof(Float32)) return kAudioHardwareBadPropertySizeError;
+                    *outDataSize = sizeof(Float32);
+                    Float32 scalar = sControlTable
+                                     ? atomic_load_explicit(&sControlTable->entries[idx].floatValue,
+                                                            memory_order_relaxed)
+                                     : 1.0f;
+                    float minDB = sLocalControls[idx].minDB;
+                    float maxDB = sLocalControls[idx].maxDB;
+                    float db = minDB + scalar * (maxDB - minDB);
+                    *(Float32 *)outData = db;
+                    return kAudioHardwareNoError;
+                }
+                break;
+
+            case kAudioLevelControlPropertyDecibelRange:
+                if (cls == kAudioLevelControlClassID) {
+                    if (inDataSize < sizeof(AudioValueRange)) return kAudioHardwareBadPropertySizeError;
+                    *outDataSize = sizeof(AudioValueRange);
+                    AudioValueRange *r = (AudioValueRange *)outData;
+                    r->mMinimum = sLocalControls[idx].minDB;
+                    r->mMaximum = sLocalControls[idx].maxDB;
+                    return kAudioHardwareNoError;
+                }
+                break;
+
+            default:
+                break;
+            }
+        }
+        break;
+    }
     }
 
     return kAudioHardwareUnknownPropertyError;
@@ -906,6 +1285,28 @@ static OSStatus RightMic_SetPropertyData(AudioServerPlugInDriverRef inDriver, Au
             /* Accept any requested buffer size (we always use our fixed size) */
             return kAudioHardwareNoError;
         }
+        if (inAddress->mSelector == kAudioDevicePropertyMute) {
+            /* Convenience property — routes to the static mute control */
+            if (inDataSize < sizeof(UInt32)) return kAudioHardwareBadPropertySizeError;
+            UInt32 v = *(const UInt32 *)inData;
+            atomic_store_explicit(&sStaticMuteValue, v, memory_order_relaxed);
+            /* Notify: static mute control value changed */
+            AudioObjectPropertyAddress ctrlAddr = {
+                kAudioBooleanControlPropertyValue,
+                kAudioObjectPropertyScopeGlobal,
+                kAudioObjectPropertyElementMain
+            };
+            sHost->PropertiesChanged(sHost, kRightMicObjectID_MuteControl, 1, &ctrlAddr);
+            /* Notify: device-level mute convenience property */
+            AudioObjectPropertyAddress devMuteAddr = {
+                kAudioDevicePropertyMute,
+                kAudioObjectPropertyScopeInput,
+                kAudioObjectPropertyElementMain
+            };
+            sHost->PropertiesChanged(sHost, kRightMicObjectID_Device, 1, &devMuteAddr);
+            LOG_INFO("Device mute set to %u", v);
+            return kAudioHardwareNoError;
+        }
         break;
 
     case kRightMicObjectID_InputStream:
@@ -924,15 +1325,136 @@ static OSStatus RightMic_SetPropertyData(AudioServerPlugInDriverRef inDriver, Au
         }
         break;
 
-    default:
+    case kRightMicObjectID_MuteControl:
+        /* Static mute control — receives AirPods Pro stem button press etc. */
+        if (inAddress->mSelector == kAudioBooleanControlPropertyValue) {
+            if (inDataSize < sizeof(UInt32)) return kAudioHardwareBadPropertySizeError;
+            UInt32 v = *(const UInt32 *)inData;
+            atomic_store_explicit(&sStaticMuteValue, v, memory_order_relaxed);
+            AudioObjectPropertyAddress ctrlAddr = {
+                kAudioBooleanControlPropertyValue,
+                kAudioObjectPropertyScopeGlobal,
+                kAudioObjectPropertyElementMain
+            };
+            sHost->PropertiesChanged(sHost, kRightMicObjectID_MuteControl, 1, &ctrlAddr);
+            AudioObjectPropertyAddress devMuteAddr = {
+                kAudioDevicePropertyMute,
+                kAudioObjectPropertyScopeInput,
+                kAudioObjectPropertyElementMain
+            };
+            sHost->PropertiesChanged(sHost, kRightMicObjectID_Device, 1, &devMuteAddr);
+            LOG_INFO("Static mute control set to %u", v);
+            return kAudioHardwareNoError;
+        }
         break;
+
+    default: {
+        /* Dynamic control object */
+        UInt32 localCount = sLocalCtrlCount;
+        if (inObjectID >= kRightMicObjectID_FirstDynControl &&
+            inObjectID < kRightMicObjectID_FirstDynControl + localCount) {
+            UInt32 idx = inObjectID - kRightMicObjectID_FirstDynControl;
+            UInt32 cls = sLocalControls[idx].classID;
+
+            if (inAddress->mSelector == kAudioBooleanControlPropertyValue &&
+                (cls == kAudioMuteControlClassID || cls == kAudioBooleanControlClassID)) {
+                if (inDataSize < sizeof(UInt32)) return kAudioHardwareBadPropertySizeError;
+                UInt32 v = *(const UInt32 *)inData;
+                atomic_store_explicit(&sDriverValues[idx], v, memory_order_relaxed);
+                /* Notify the control value changed */
+                AudioObjectPropertyAddress ctrlAddr = {
+                    kAudioBooleanControlPropertyValue,
+                    kAudioObjectPropertyScopeGlobal,
+                    kAudioObjectPropertyElementMain
+                };
+                sHost->PropertiesChanged(sHost, inObjectID, 1, &ctrlAddr);
+                /* Also notify device mute (convenience property) */
+                AudioObjectPropertyAddress devMuteAddr = {
+                    kAudioDevicePropertyMute,
+                    kAudioObjectPropertyScopeInput,
+                    kAudioObjectPropertyElementMain
+                };
+                sHost->PropertiesChanged(sHost, kRightMicObjectID_Device, 1, &devMuteAddr);
+                LOG_INFO("Control %u (mute) set to %u", idx, v);
+                return kAudioHardwareNoError;
+            }
+
+            if (inAddress->mSelector == kAudioLevelControlPropertyScalarValue &&
+                cls == kAudioLevelControlClassID) {
+                if (inDataSize < sizeof(Float32)) return kAudioHardwareBadPropertySizeError;
+                Float32 v = *(const Float32 *)inData;
+                /* Write into the shared memory entry (app-side) if available */
+                if (sControlTable) {
+                    atomic_store_explicit(&sControlTable->entries[idx].floatValue,
+                                          v, memory_order_relaxed);
+                }
+                AudioObjectPropertyAddress ctrlAddr = {
+                    kAudioLevelControlPropertyScalarValue,
+                    kAudioObjectPropertyScopeGlobal,
+                    kAudioObjectPropertyElementMain
+                };
+                sHost->PropertiesChanged(sHost, inObjectID, 1, &ctrlAddr);
+                LOG_INFO("Control %u (level) scalar set to %.3f", idx, v);
+                return kAudioHardwareNoError;
+            }
+        }
+        break;
+    }
     }
 
     return kAudioHardwareUnknownPropertyError;
 }
 
 /* ================================================================
- * Section 14 – Shared Memory Ring Buffer
+ * Section 14 – Dynamic Control Cache
+ * ================================================================ */
+
+#pragma mark - Control Cache
+
+/* Called on the main queue whenever the app bumps the control table version.
+ * Copies the shared memory entries into the local cache (safe to read from
+ * property functions without locks) and notifies CoreAudio of the change. */
+static void RightMic_UpdateControlCache(void)
+{
+    if (sControlTable == NULL) {
+        sLocalCtrlCount = 0;
+        return;
+    }
+
+    uint32_t count = atomic_load_explicit(&sControlTable->count, memory_order_acquire);
+    if (count > kRightMic_MaxControls) count = kRightMic_MaxControls;
+
+    for (uint32_t i = 0; i < count; i++) {
+        sLocalControls[i].classID    = sControlTable->entries[i].classID;
+        sLocalControls[i].scope      = sControlTable->entries[i].scope;
+        sLocalControls[i].element    = sControlTable->entries[i].element;
+        sLocalControls[i].minDB      = sControlTable->entries[i].minDB;
+        sLocalControls[i].maxDB      = sControlTable->entries[i].maxDB;
+        /* Atomic reads for values that the app may update concurrently */
+        sLocalControls[i].uintValue  = (uint32_t)atomic_load_explicit(
+            &sControlTable->entries[i].uintValue, memory_order_relaxed);
+        sLocalControls[i].floatValue = atomic_load_explicit(
+            &sControlTable->entries[i].floatValue, memory_order_relaxed);
+    }
+    sLocalCtrlCount = count;
+
+    LOG_INFO("Control cache updated: %u controls", count);
+
+    if (sHost != NULL) {
+        AudioObjectPropertyAddress addrs[2] = {
+            { kAudioObjectPropertyControlList,
+              kAudioObjectPropertyScopeGlobal,
+              kAudioObjectPropertyElementMain },
+            { kAudioObjectPropertyOwnedObjects,
+              kAudioObjectPropertyScopeGlobal,
+              kAudioObjectPropertyElementMain },
+        };
+        sHost->PropertiesChanged(sHost, kRightMicObjectID_Device, 2, addrs);
+    }
+}
+
+/* ================================================================
+ * Section 15 – Shared Memory Ring Buffer
  * ================================================================ */
 
 #pragma mark - Shared Memory
@@ -963,31 +1485,45 @@ static void RightMic_OpenSharedMemory(void)
         return;
     }
 
-    sShm_Ptr = mmap(NULL, kRightMic_SharedMemorySize, PROT_READ, MAP_SHARED, sShm_FD, 0);
+    /* Map V2 size if the app has already written the control table, V1 otherwise */
+    bool hasControlTable = (st.st_size >= (off_t)kRightMic_SharedMemorySizeV2);
+    sShm_MapSize = hasControlTable ? kRightMic_SharedMemorySizeV2 : kRightMic_SharedMemorySize;
+
+    sShm_Ptr = mmap(NULL, sShm_MapSize, PROT_READ, MAP_SHARED, sShm_FD, 0);
     if (sShm_Ptr == MAP_FAILED) {
         LOG_ERROR("Failed to mmap shared memory file");
         close(sShm_FD);
         sShm_FD = -1;
+        sShm_MapSize = 0;
         return;
     }
 
     sRingHeader = (RightMicRingBufferHeader *)sShm_Ptr;
     sRingData   = (float *)((uint8_t *)sShm_Ptr + sizeof(RightMicRingBufferHeader));
-    LOG_INFO("Shared memory mapped successfully");
+
+    if (hasControlTable) {
+        sControlTable = (RightMicControlTable *)((uint8_t *)sShm_Ptr + kRightMic_ControlTableOffset);
+        LOG_INFO("Shared memory mapped (V2, %zu bytes, control table present)", sShm_MapSize);
+    } else {
+        sControlTable = NULL;
+        LOG_INFO("Shared memory mapped (V1, %zu bytes, no control table)", sShm_MapSize);
+    }
 }
 
 static void RightMic_CloseSharedMemory(void)
 {
     if (sShm_Ptr != MAP_FAILED) {
-        munmap(sShm_Ptr, kRightMic_SharedMemorySize);
+        munmap(sShm_Ptr, sShm_MapSize > 0 ? sShm_MapSize : kRightMic_SharedMemorySize);
         sShm_Ptr = MAP_FAILED;
+        sShm_MapSize = 0;
     }
     if (sShm_FD >= 0) {
         close(sShm_FD);
         sShm_FD = -1;
     }
-    sRingHeader = NULL;
-    sRingData   = NULL;
+    sRingHeader   = NULL;
+    sRingData     = NULL;
+    sControlTable = NULL;
 }
 
 /* ================================================================
@@ -1091,7 +1627,18 @@ static OSStatus RightMic_DoIOOperation(AudioServerPlugInDriverRef inDriver, Audi
         RightMic_OpenSharedMemory();
     }
 
-    /* Read from shared memory ring buffer if available and active */
+    /* Check if control table version changed; dispatch cache update on main queue.
+     * Done before filling the buffer so it runs every IO cycle regardless of path. */
+    if (sControlTable != NULL) {
+        uint32_t newVer = (uint32_t)atomic_load_explicit(&sControlTable->version, memory_order_relaxed);
+        if (newVer != sLastCtrlVersion) {
+            sLastCtrlVersion = newVer;
+            dispatch_async(dispatch_get_main_queue(), ^{ RightMic_UpdateControlCache(); });
+        }
+    }
+
+    /* Fill output buffer: copy from ring buffer if data is available, else silence */
+    bool filledFromRing = false;
     if (sRingHeader != NULL && atomic_load_explicit(&sRingHeader->active, memory_order_acquire)) {
         uint64_t wHead = atomic_load_explicit(&sRingHeader->writeHead, memory_order_acquire);
 
@@ -1110,7 +1657,6 @@ static OSStatus RightMic_DoIOOperation(AudioServerPlugInDriverRef inDriver, Audi
         uint64_t available = wHead - sLocalReadHead;
 
         if (available >= framesToFill) {
-            /* Copy frames from the ring buffer */
             UInt32 framesRead = 0;
             while (framesRead < framesToFill) {
                 uint64_t ringIndex = (sLocalReadHead + framesRead) % kRightMic_RingBufferFrames;
@@ -1123,16 +1669,39 @@ static OSStatus RightMic_DoIOOperation(AudioServerPlugInDriverRef inDriver, Audi
                        chunk * kRightMic_BytesPerFrame);
                 framesRead += chunk;
             }
-
-            /* Advance local read head */
             sLocalReadHead += framesToFill;
-            return kAudioHardwareNoError;
+            filledFromRing = true;
         }
-        /* Not enough data – fall through to silence */
     }
 
-    /* Fill with silence */
-    memset(outBuffer, 0, samplesToFill * sizeof(float));
+    if (!filledFromRing) {
+        memset(outBuffer, 0, samplesToFill * sizeof(float));
+    }
+
+    /* Apply mute: zero the buffer if any mute source is active.
+     * Sources checked in priority order:
+     *   1. Static mute control (objectID 4) — AirPods Pro stem button, system mute
+     *   2. App-side header mute — real device muted externally (listener → header->muted)
+     *   3. Dynamic mute controls (objectIDs 5+) — proxied real device mute controls
+     * Read heads are always advanced even when muted to prevent stale burst on unmute. */
+    bool muted = atomic_load_explicit(&sStaticMuteValue, memory_order_relaxed) != 0;
+    if (!muted && sRingHeader != NULL) {
+        muted = atomic_load_explicit(&sRingHeader->muted, memory_order_relaxed) != 0;
+    }
+    if (!muted && sControlTable != NULL) {
+        for (uint32_t i = 0; i < sLocalCtrlCount && !muted; i++) {
+            if (sLocalControls[i].classID == kAudioMuteControlClassID) {
+                uint32_t av = (uint32_t)atomic_load_explicit(
+                    &sControlTable->entries[i].uintValue, memory_order_relaxed);
+                uint32_t dv = (uint32_t)atomic_load_explicit(&sDriverValues[i], memory_order_relaxed);
+                muted = (av != 0) || (dv != 0);
+            }
+        }
+    }
+    if (muted) {
+        memset(outBuffer, 0, samplesToFill * sizeof(float));
+    }
+
     return kAudioHardwareNoError;
 }
 
