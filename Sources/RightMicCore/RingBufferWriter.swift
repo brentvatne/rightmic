@@ -21,9 +21,10 @@ public final class RingBufferWriter {
     public static let ringBufferFrames: Int = 16384
     public static let channelCount: Int = 2
     public static let bytesPerFrame: Int = channelCount * MemoryLayout<Float32>.size
-    public static let headerSize: Int = 64  // sizeof(RightMicRingBufferHeader)
+    public static let headerSize: Int = 64   // sizeof(RightMicRingBufferHeader)
     public static let dataSize: Int = ringBufferFrames * bytesPerFrame
-    public static let totalSize: Int = headerSize + dataSize
+    public static let controlTableSize: Int = 128  // sizeof(RightMicControlTable)
+    public static let totalSize: Int = headerSize + dataSize + controlTableSize
 
     // MARK: - State
 
@@ -32,20 +33,56 @@ public final class RingBufferWriter {
     private var mappedPtr: UnsafeMutableRawPointer?
     private var header: UnsafeMutablePointer<RingBufferHeader>?
     private var audioData: UnsafeMutablePointer<Float>?
+    private var controlTable: UnsafeMutablePointer<ControlTable>?
 
     public var isOpen: Bool { mappedPtr != nil }
 
-    // MARK: - Ring Buffer Header Layout (matches C struct)
+    // MARK: - Shared Memory Layout (matches RightMicDriver.h)
 
     /// Mirror of `RightMicRingBufferHeader` from the driver.
     /// Uses the same memory layout so the driver and app share state.
     struct RingBufferHeader {
-        var writeHead: UInt64
-        var readHead: UInt64
-        var active: UInt32
+        var writeHead:  UInt64
+        var readHead:   UInt64
+        var active:     UInt32
         var sampleRate: UInt32
-        var channels: UInt32
-        var _pad: (UInt32, UInt32, UInt32, UInt32, UInt32, UInt32, UInt32, UInt32, UInt32)  // 9 x UInt32 = 36 bytes → total 64
+        var channels:   UInt32
+        var muted:      UInt32   // 1 = app-side mute override (was _pad[0])
+        var _pad: (UInt32, UInt32, UInt32, UInt32, UInt32, UInt32, UInt32, UInt32)  // 8 × UInt32 → total 64 bytes
+    }
+
+    /// One proxied control entry.  Mirrors `RightMicControlEntry` in the driver.
+    public struct ControlEntry {
+        public var classID:    UInt32  // AudioClassID (kAudioMuteControlClassID, etc.)
+        public var scope:      UInt32  // AudioObjectPropertyScope
+        public var element:    UInt32  // AudioObjectPropertyElement
+        public var uintValue:  UInt32  // boolean controls: 0/1
+        public var floatValue: Float   // level controls: 0.0–1.0 scalar
+        public var minDB:      Float   // level controls: minimum dB
+        public var maxDB:      Float   // level controls: maximum dB
+
+        public init(classID: UInt32, scope: UInt32, element: UInt32,
+                    uintValue: UInt32, floatValue: Float, minDB: Float, maxDB: Float) {
+            self.classID    = classID
+            self.scope      = scope
+            self.element    = element
+            self.uintValue  = uintValue
+            self.floatValue = floatValue
+            self.minDB      = minDB
+            self.maxDB      = maxDB
+        }
+    }
+
+    /// Mirrors `RightMicControlTable` in the driver (128 bytes).
+    private struct ControlTable {
+        var version: UInt32
+        var count:   UInt32
+        // 4 control entries (4 × 28 = 112 bytes)
+        var entry0: ControlEntry
+        var entry1: ControlEntry
+        var entry2: ControlEntry
+        var entry3: ControlEntry
+        var _pad: (UInt32, UInt32)  // pad to 128 bytes
     }
 
     // MARK: - Lifecycle
@@ -65,6 +102,8 @@ public final class RingBufferWriter {
         guard !isOpen else { return }
         assert(MemoryLayout<RingBufferHeader>.size == Self.headerSize,
                "RingBufferHeader size mismatch with headerSize constant")
+        assert(MemoryLayout<ControlTable>.size == Self.controlTableSize,
+               "ControlTable size mismatch with controlTableSize constant")
 
         // Create the backing file. O_NOFOLLOW prevents symlink attacks.
         // Permissions: owner read-write, others read-only (0644).
@@ -115,12 +154,20 @@ public final class RingBufferWriter {
         mappedPtr = ptr
         header = ptr!.assumingMemoryBound(to: RingBufferHeader.self)
         audioData = ptr!.advanced(by: Self.headerSize).assumingMemoryBound(to: Float.self)
+        controlTable = ptr!.advanced(by: Self.headerSize + Self.dataSize)
+                           .assumingMemoryBound(to: ControlTable.self)
 
         // Initialize header
         header!.pointee.writeHead = 0
         header!.pointee.readHead = 0
         header!.pointee.sampleRate = UInt32(48000)
         header!.pointee.channels = UInt32(Self.channelCount)
+        header!.pointee.muted = 0
+
+        // Initialize control table
+        controlTable!.pointee.version = 0
+        controlTable!.pointee.count = 0
+
         setActive(true)
 
         NSLog("[RightMic] Ring buffer opened (size: \(Self.totalSize) bytes)")
@@ -142,6 +189,7 @@ public final class RingBufferWriter {
 
         header = nil
         audioData = nil
+        controlTable = nil
 
         if fd >= 0 {
             Darwin.close(fd)
@@ -196,6 +244,38 @@ public final class RingBufferWriter {
     private func setActive(_ active: Bool) {
         guard let header = header else { return }
         header.pointee.active = active ? 1 : 0
+    }
+
+    // MARK: - Mute
+
+    /// Set the app-side mute override in the ring buffer header.
+    /// The driver ORs this with its own HAL-control mute state.
+    public func setMuted(_ muted: Bool) {
+        guard let header = header else { return }
+        header.pointee.muted = muted ? 1 : 0
+    }
+
+    // MARK: - Control Table
+
+    /// Push the real device's CoreAudio control list into shared memory.
+    /// The driver detects the version bump and re-exposes these controls
+    /// on the virtual device.  Pass an empty array to clear all controls.
+    public func setControls(_ controls: [ControlEntry]) {
+        guard let ct = controlTable else { return }
+        let n = min(controls.count, 4)
+
+        // Write all entry data first (visible to driver only after count + version update)
+        let emptyEntry = ControlEntry(classID: 0, scope: 0, element: 0,
+                                      uintValue: 0, floatValue: 0, minDB: 0, maxDB: 0)
+        ct.pointee.entry0 = n > 0 ? controls[0] : emptyEntry
+        ct.pointee.entry1 = n > 1 ? controls[1] : emptyEntry
+        ct.pointee.entry2 = n > 2 ? controls[2] : emptyEntry
+        ct.pointee.entry3 = n > 3 ? controls[3] : emptyEntry
+
+        // Barrier ensures entry data is visible before count/version
+        OSMemoryBarrier()
+        ct.pointee.count   = UInt32(n)
+        ct.pointee.version &+= 1
     }
 
     // MARK: - Errors

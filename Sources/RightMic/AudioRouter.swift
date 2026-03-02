@@ -44,6 +44,9 @@ final class AudioRouter {
     private var currentDeviceUID: String?
     private weak var monitor: DeviceMonitor?
 
+    /// DeviceID for which a mute property listener is currently installed.
+    private var muteListenerDeviceID: AudioDeviceID?
+
     /// The device that was system default before we switched to RightMic.
     private var savedDefaultDeviceID: AudioDeviceID?
 
@@ -142,6 +145,17 @@ final class AudioRouter {
 
         currentDeviceUID = deviceUID
 
+        // Enumerate real device's CoreAudio controls and push to shared memory.
+        // The driver detects the version change and exposes the same controls
+        // on the virtual device so macOS can route hardware control events.
+        let controls = enumerateControls(deviceID: deviceID)
+        ringBufferWriter.setControls(controls)
+        NSLog("[RightMic] Pushed %d controls to driver for device %d", controls.count, deviceID)
+
+        // Listen for mute state changes on the real device.
+        // When the physical device reports muted, we silence the ring buffer output.
+        installMuteListener(deviceID: deviceID)
+
         // Reset diagnostic state
         renderErrorLogged = false
 
@@ -185,6 +199,10 @@ final class AudioRouter {
         destroyAudioConverter()
 
         if currentDeviceUID != nil {
+            // Remove mute listener and clear controls before closing the ring buffer
+            removeMuteListener()
+            ringBufferWriter.setControls([])
+
             let t4 = CFAbsoluteTimeGetCurrent()
             ringBufferWriter.close()
             NSLog("[RightMic] stopCapture: ringBufferWriter.close took %.3fs", CFAbsoluteTimeGetCurrent() - t4)
@@ -226,6 +244,138 @@ final class AudioRouter {
             NSLog("[RightMic] System default input restored")
         }
         savedDefaultDeviceID = nil
+    }
+
+    // MARK: - Device Control Proxying
+
+    /// Enumerate all CoreAudio input controls on the given device and return
+    /// them as ControlEntry values suitable for writing to the ring buffer's
+    /// control table.  Unrecognised control classes are silently skipped.
+    private func enumerateControls(deviceID: AudioDeviceID) -> [RingBufferWriter.ControlEntry] {
+        var addr = AudioObjectPropertyAddress(
+            mSelector: kAudioObjectPropertyControlList,
+            mScope: kAudioObjectPropertyScopeInput,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        var size: UInt32 = 0
+        guard AudioObjectGetPropertyDataSize(deviceID, &addr, 0, nil, &size) == noErr,
+              size > 0 else { return [] }
+
+        let count = Int(size) / MemoryLayout<AudioObjectID>.size
+        var controlIDs = [AudioObjectID](repeating: 0, count: count)
+        guard AudioObjectGetPropertyData(deviceID, &addr, 0, nil, &size, &controlIDs) == noErr
+        else { return [] }
+
+        NSLog("[RightMic] Device %d has %d input controls", deviceID, count)
+
+        return controlIDs.compactMap { controlID -> RingBufferWriter.ControlEntry? in
+            // Read the control's class
+            var classAddr = AudioObjectPropertyAddress(
+                mSelector: kAudioObjectPropertyClass,
+                mScope: kAudioObjectPropertyScopeGlobal,
+                mElement: kAudioObjectPropertyElementMain
+            )
+            var classID: AudioClassID = 0
+            var sz = UInt32(MemoryLayout<AudioClassID>.size)
+            guard AudioObjectGetPropertyData(controlID, &classAddr, 0, nil, &sz, &classID) == noErr
+            else { return nil }
+
+            switch classID {
+            case AudioClassID(kAudioMuteControlClassID):
+                var muteAddr = AudioObjectPropertyAddress(
+                    mSelector: kAudioBooleanControlPropertyValue,
+                    mScope: kAudioObjectPropertyScopeGlobal,
+                    mElement: kAudioObjectPropertyElementMain
+                )
+                var muted: UInt32 = 0
+                var sz2 = UInt32(MemoryLayout<UInt32>.size)
+                AudioObjectGetPropertyData(controlID, &muteAddr, 0, nil, &sz2, &muted)
+                NSLog("[RightMic]   mute control %d: muted=%d", controlID, muted)
+                return RingBufferWriter.ControlEntry(
+                    classID: classID,
+                    scope: kAudioObjectPropertyScopeInput,
+                    element: kAudioObjectPropertyElementMain,
+                    uintValue: muted, floatValue: 0, minDB: 0, maxDB: 0)
+
+            case AudioClassID(kAudioLevelControlClassID):
+                var valAddr = AudioObjectPropertyAddress(
+                    mSelector: kAudioLevelControlPropertyScalarValue,
+                    mScope: kAudioObjectPropertyScopeGlobal,
+                    mElement: kAudioObjectPropertyElementMain
+                )
+                var scalar: Float = 1.0
+                var sv = UInt32(MemoryLayout<Float>.size)
+                AudioObjectGetPropertyData(controlID, &valAddr, 0, nil, &sv, &scalar)
+
+                var rangeAddr = AudioObjectPropertyAddress(
+                    mSelector: kAudioLevelControlPropertyDecibelRange,
+                    mScope: kAudioObjectPropertyScopeGlobal,
+                    mElement: kAudioObjectPropertyElementMain
+                )
+                var range = AudioValueRange(mMinimum: -96, mMaximum: 0)
+                var rv = UInt32(MemoryLayout<AudioValueRange>.size)
+                AudioObjectGetPropertyData(controlID, &rangeAddr, 0, nil, &rv, &range)
+                NSLog("[RightMic]   level control %d: scalar=%.2f range=[%.1f, %.1f]",
+                      controlID, scalar, range.mMinimum, range.mMaximum)
+                return RingBufferWriter.ControlEntry(
+                    classID: classID,
+                    scope: kAudioObjectPropertyScopeInput,
+                    element: kAudioObjectPropertyElementMain,
+                    uintValue: 0, floatValue: scalar,
+                    minDB: Float(range.mMinimum), maxDB: Float(range.mMaximum))
+
+            default:
+                return nil
+            }
+        }
+    }
+
+    // MARK: - Mute Listener
+
+    private func installMuteListener(deviceID: AudioDeviceID) {
+        removeMuteListener()
+        var addr = AudioObjectPropertyAddress(
+            mSelector: kAudioDevicePropertyMute,
+            mScope: kAudioObjectPropertyScopeInput,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        guard AudioObjectHasProperty(deviceID, &addr) else {
+            NSLog("[RightMic] Device %d has no input mute property, skipping listener", deviceID)
+            return
+        }
+        let ctx = Unmanaged.passUnretained(self).toOpaque()
+        AudioObjectAddPropertyListener(deviceID, &addr, mutePropertyListenerProc, ctx)
+        muteListenerDeviceID = deviceID
+        syncMuteFromDevice(deviceID: deviceID)
+        NSLog("[RightMic] Mute listener installed for device %d", deviceID)
+    }
+
+    private func removeMuteListener() {
+        guard let deviceID = muteListenerDeviceID else { return }
+        var addr = AudioObjectPropertyAddress(
+            mSelector: kAudioDevicePropertyMute,
+            mScope: kAudioObjectPropertyScopeInput,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        let ctx = Unmanaged.passUnretained(self).toOpaque()
+        AudioObjectRemovePropertyListener(deviceID, &addr, mutePropertyListenerProc, ctx)
+        muteListenerDeviceID = nil
+        ringBufferWriter.setMuted(false)
+        NSLog("[RightMic] Mute listener removed for device %d", deviceID)
+    }
+
+    /// Called from the C property listener callback (dispatched to main queue).
+    func syncMuteFromDevice(deviceID: AudioDeviceID) {
+        var addr = AudioObjectPropertyAddress(
+            mSelector: kAudioDevicePropertyMute,
+            mScope: kAudioObjectPropertyScopeInput,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        var muted: UInt32 = 0
+        var size = UInt32(MemoryLayout<UInt32>.size)
+        guard AudioObjectGetPropertyData(deviceID, &addr, 0, nil, &size, &muted) == noErr else { return }
+        ringBufferWriter.setMuted(muted != 0)
+        NSLog("[RightMic] Device %d mute → %@", deviceID, muted != 0 ? "muted" : "unmuted")
     }
 
     // MARK: - AUHAL Configuration
@@ -599,4 +749,22 @@ private func upmixMonoToStereo(buffer: UnsafeMutablePointer<Float>, frameCount: 
         buffer[i * 2 + 1] = sample  // R
         buffer[i * 2]     = sample  // L
     }
+}
+
+// MARK: - Mute Property Listener Callback
+
+/// C-function callback invoked by CoreAudio when the selected real device's
+/// mute state changes.  Dispatches to the main queue to call syncMuteFromDevice.
+private func mutePropertyListenerProc(
+    objectID: AudioObjectID,
+    addressCount: UInt32,
+    addresses: UnsafePointer<AudioObjectPropertyAddress>,
+    clientData: UnsafeMutableRawPointer?
+) -> OSStatus {
+    guard let clientData else { return noErr }
+    let router = Unmanaged<AudioRouter>.fromOpaque(clientData).takeUnretainedValue()
+    DispatchQueue.main.async {
+        router.syncMuteFromDevice(deviceID: objectID)
+    }
+    return noErr
 }
