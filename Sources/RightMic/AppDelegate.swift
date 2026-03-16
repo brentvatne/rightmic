@@ -4,10 +4,10 @@ import RightMicCore
 import ServiceManagement
 import SwiftUI
 
-final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
+final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private var statusItem: NSStatusItem!
-    private var popover: NSPopover!
+    private var panel: PopoverPanel?
     private let monitor = DeviceMonitor()
     private var audioRouter: AudioRouter?
     private var hostingView: PassthroughHostingView<MenuBarView>!
@@ -15,15 +15,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     private var rightClickMonitor: Any?
     private var settingsWindow: NSWindow?
     private var manageWindow: NSWindow?
-    /// Invisible window used to anchor the popover at the correct screen position.
-    /// Works around an NSPopover bug where status item coordinates go stale after display changes.
-    private var popoverProxy: NSWindow?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSLog("[RightMic] applicationDidFinishLaunching")
         cleanupStaleSharedMemory()
         setupStatusItem()
-        setupPopover()
         setupEventMonitor()
         setupRightClickMenu()
         requestPermission()
@@ -83,37 +79,78 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         button.target = self
     }
 
-    // MARK: - Popover
+    // MARK: - Panel
 
-    private func setupPopover() {
-        popover = NSPopover()
-        popover.behavior = .transient
-        popover.animates = true
-        popover.delegate = self
-
-        let popoverView = PopoverContentView(monitor: monitor)
-        popover.contentViewController = NSHostingController(rootView: popoverView)
+    private func closePanel() {
+        panel?.close()
+        panel = nil
     }
 
-    func popoverDidClose(_ notification: Notification) {
-        popoverProxy?.close()
-        popoverProxy = nil
-    }
+    private func showPanel() {
+        let mouseLocation = NSEvent.mouseLocation
+        guard let screen = NSScreen.screens.first(where: {
+            $0.frame.contains(mouseLocation)
+        }) else { return }
 
-    private func updatePopoverSize() {
+        // Calculate panel size (same formula the old NSPopover used)
         let entryCount = monitor.priorityConfig.entries.count
         let padding: CGFloat = 12
         let listHeight: CGFloat = entryCount > 0
             ? CGFloat(entryCount) * 32
             : 100
-        popover.contentSize = NSSize(width: 300, height: listHeight + padding)
+        let panelWidth: CGFloat = 300
+        let panelHeight = listHeight + padding
+
+        // Position below menu bar, centered on mouse, clamped to screen edges
+        let menuBarBottom = screen.visibleFrame.maxY
+        var panelX = mouseLocation.x - panelWidth / 2
+        panelX = max(screen.visibleFrame.minX + 4,
+                     min(panelX, screen.visibleFrame.maxX - panelWidth - 4))
+        let panelY = menuBarBottom - panelHeight
+
+        let newPanel = PopoverPanel(
+            contentRect: NSRect(x: panelX, y: panelY, width: panelWidth, height: panelHeight),
+            styleMask: [.borderless, .nonactivatingPanel],
+            backing: .buffered,
+            defer: false
+        )
+        newPanel.isFloatingPanel = true
+        newPanel.level = .statusBar
+        newPanel.isOpaque = false
+        newPanel.backgroundColor = .clear
+        newPanel.hasShadow = true
+
+        // Visual effect background (matches system popover appearance)
+        let visualEffect = NSVisualEffectView()
+        visualEffect.material = .popover
+        visualEffect.state = .active
+        visualEffect.blendingMode = .behindWindow
+        visualEffect.wantsLayer = true
+        visualEffect.layer?.cornerRadius = 10
+        visualEffect.layer?.masksToBounds = true
+        newPanel.contentView = visualEffect
+
+        // SwiftUI content pinned to all edges via auto layout
+        let contentView = PopoverContentView(monitor: monitor)
+        let hostingView = NSHostingView(rootView: contentView)
+        hostingView.translatesAutoresizingMaskIntoConstraints = false
+        visualEffect.addSubview(hostingView)
+        NSLayoutConstraint.activate([
+            hostingView.topAnchor.constraint(equalTo: visualEffect.topAnchor),
+            hostingView.leadingAnchor.constraint(equalTo: visualEffect.leadingAnchor),
+            hostingView.trailingAnchor.constraint(equalTo: visualEffect.trailingAnchor),
+            hostingView.bottomAnchor.constraint(equalTo: visualEffect.bottomAnchor),
+        ])
+
+        newPanel.makeKeyAndOrderFront(nil)
+        panel = newPanel
     }
 
     // MARK: - Settings Window
 
     func openSettings() {
-        if popover.isShown {
-            popover.performClose(nil)
+        if panel?.isVisible == true {
+            closePanel()
         }
 
         if let window = settingsWindow {
@@ -138,42 +175,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     }
 
     @objc private func togglePopover(_ sender: AnyObject?) {
-        guard let button = statusItem.button else { return }
-
-        if popover.isShown {
-            popover.performClose(sender)
+        if let panel = panel, panel.isVisible {
+            closePanel()
         } else {
-            updatePopoverSize()
-
-            // Anchor the popover to an invisible proxy window placed at the button's
-            // current screen rect. This avoids stale coordinates from the status bar
-            // window that can cause the popover to drift after display changes.
-            guard let buttonWindow = button.window else { return }
-            let screenRect = buttonWindow.convertToScreen(
-                button.convert(button.bounds, to: nil)
-            )
-
-            popoverProxy?.close()
-            let proxy = NSWindow(
-                contentRect: screenRect,
-                styleMask: [.borderless],
-                backing: .buffered,
-                defer: false
-            )
-            proxy.isOpaque = false
-            proxy.backgroundColor = .clear
-            proxy.hasShadow = false
-            proxy.ignoresMouseEvents = true
-            proxy.level = .statusBar
-            proxy.orderFront(nil)
-            popoverProxy = proxy
-
-            popover.show(
-                relativeTo: proxy.contentView!.bounds,
-                of: proxy.contentView!,
-                preferredEdge: .minY
-            )
-            popover.contentViewController?.view.window?.makeKey()
+            showPanel()
         }
     }
 
@@ -227,7 +232,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     }
 
     @objc private func openManageDevices() {
-        if popover.isShown { popover.performClose(nil) }
+        if panel?.isVisible == true { closePanel() }
 
         if let window = manageWindow {
             window.makeKeyAndOrderFront(nil)
@@ -273,8 +278,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         eventMonitor = NSEvent.addGlobalMonitorForEvents(
             matching: [.leftMouseDown, .rightMouseDown]
         ) { [weak self] _ in
-            if let popover = self?.popover, popover.isShown {
-                popover.performClose(nil)
+            if let panel = self?.panel, panel.isVisible {
+                self?.closePanel()
             }
         }
     }
@@ -284,6 +289,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     private func requestPermission() {
         monitor.requestPermission { _ in }
     }
+}
+
+/// Custom panel for menu bar popover, positioned explicitly to avoid
+/// NSPopover coordinate drift after display changes.
+final class PopoverPanel: NSPanel {
+    override var canBecomeKey: Bool { true }
 }
 
 /// NSHostingView subclass that passes all mouse events through to the
