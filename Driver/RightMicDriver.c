@@ -62,6 +62,9 @@ static float *                  sRingData   = NULL;
 /* Driver-local read head (avoids needing write access to shared memory) */
 static uint64_t sLocalReadHead = 0;
 
+/* Overflow event counter — rate-limits log messages from the IO thread */
+static uint64_t sOverflowCount = 0;
+
 /* Size of the currently-mapped shared memory region */
 static size_t sShm_MapSize = 0;
 
@@ -1543,6 +1546,7 @@ static OSStatus RightMic_StartIO(AudioServerPlugInDriverRef inDriver, AudioObjec
     sIO_HostTicksPerPeriod = (uint64_t)(nsPerPeriod * (Float64)sTimebaseInfo.denom / (Float64)sTimebaseInfo.numer);
 
     sLocalReadHead = 0;
+    sOverflowCount = 0;
     RightMic_OpenSharedMemory();
 
     atomic_store(&sDeviceIsRunning, true);
@@ -1655,6 +1659,22 @@ static OSStatus RightMic_DoIOOperation(AudioServerPlugInDriverRef inDriver, Audi
         }
 
         uint64_t available = wHead - sLocalReadHead;
+
+        /* Overflow: the writer has lapped the reader due to clock drift
+         * between the app's hardware sample clock and the driver's
+         * mach_absolute_time-based clock.  Re-sync the read head to just
+         * behind the write head so the next copy reads valid (recent)
+         * data.  This trades a single ~10ms glitch for preventing
+         * sustained garbled output. */
+        if (available > kRightMic_RingBufferFrames) {
+            sOverflowCount++;
+            if (sOverflowCount == 1 || (sOverflowCount % 100) == 0) {
+                LOG_INFO("Ring buffer overflow #%llu (available=%llu, ring=%d). Re-syncing read head.",
+                         (unsigned long long)sOverflowCount, (unsigned long long)available, kRightMic_RingBufferFrames);
+            }
+            sLocalReadHead = wHead - framesToFill;
+            available = framesToFill;
+        }
 
         if (available >= framesToFill) {
             UInt32 framesRead = 0;

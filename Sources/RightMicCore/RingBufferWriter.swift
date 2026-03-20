@@ -234,7 +234,10 @@ public final class RingBufferWriter {
             written += chunk
         }
 
-        // Memory barrier ensures the driver sees the audio data before the updated head
+        // Memory barrier ensures the driver sees the audio data before the updated head.
+        // Note: the 64-bit store below is atomic at the hardware level on both arm64 and
+        // x86_64 (aligned natural-width stores).  The C-side driver reads via
+        // atomic_load_explicit with memory_order_acquire, which pairs with this barrier.
         OSMemoryBarrier()
         header.pointee.writeHead = wHead
     }
